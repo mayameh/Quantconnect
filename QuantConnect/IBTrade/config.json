@@ -1,0 +1,10 @@
+{
+    "cloud-id": 24986736,
+    "organization-id": "f8304c0dc76be85041585d1d5f28569e",
+    "channel-id": "LOCAL-8b968edc6d715d4232d1c13c9f119d4f",
+    "description": "",
+    "algorithm-language": "Python",
+    "parameters": {},
+    "deployment-target": "Cloud Platform",
+    "python-venv": 1
+}
