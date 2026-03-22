@@ -1,0 +1,1376 @@
+from AlgorithmImports import *
+from datetime import datetime, timedelta, time as dt_time  # Add 'time as dt_time'
+from production_config import BOT_Config
+from production_wrapper import RiskManager
+from production_config import ProductionLogger
+from collections import defaultdict, deque
+
+class MayankAlgo_Production(QCAlgorithm):
+    def initialize(self) -> None:
+        self.config = BOT_Config()
+        self.logger = ProductionLogger(self.config)
+        self.debug("Initializing Production Algorithm")
+        
+        
+        if self.config.general.mode == "LIVE":
+            self.logger.critical("LIVE TRADING MODE ENABLED")
+            self.set_brokerage_model(
+                BrokerageName.INTERACTIVE_BROKERS_BROKERAGE, 
+                AccountType.CASH
+            )
+        else:
+            self.logger.info("PAPER TRADING MODE")
+        
+        self.set_start_date(2022, 1, 1)
+        self.set_end_date(2024, 12, 31)
+        self.set_cash(self.config.general.starting_capital)
+        self._starting_cash = self.portfolio.cash
+        
+        self._core_symbols = []
+        self._dynamic_symbols = set()
+        self._all_symbols = set()
+        self._algo_managed_positions = set()
+        self.spy = None  # Initialize to None, will be set later
+        self.spy_ema_20 = None
+        self.spy_ema_50 = None
+        self.spy_rsi = None
+        self._indicators = {}
+        self.entry_time = {}
+        self.entry_price = {}
+        self.highest_price = {}
+        self._bear_market_entries = set()  # Track which positions were entered during bear market
+        self._bear_market_scan_results = []  # Track latest bear market scan results
+        self._bear_dca_entries = {}  # Track DCA entries: {symbol: [{'time': datetime, 'price': float, 'qty': int}]}
+        self._bear_dca_last_buy = {}  # Track last buy time for each symbol
+        self.market_regime = "NEUTRAL"
+        self._spy_peak = None  # Track SPY peak for bear market severity
+        self._last_universe_selection = None
+        self.trade_history = deque(maxlen=50)
+        
+        self.risk_manager = RiskManager(self.logger, self.config)
+        self.peak_equity = self._starting_cash
+        self.max_positions = self.config.trading.max_positions
+        
+        try:
+            # Main SPY symbol is critical for scheduling - fail if not added
+            self.spy = self.add_equity("SPY", Resolution.DAILY, "USA").symbol
+            
+            # Indicators are secondary but important for regime
+            self.spy_ema_20 = self.ema(self.spy, 20, Resolution.DAILY)
+            self.spy_ema_50 = self.ema(self.spy, 50, Resolution.DAILY)
+            self.spy_rsi = self.rsi(self.spy, 14, MovingAverageType.EXPONENTIAL, Resolution.DAILY)
+            self.logger.info("Added SPY regime tracker")
+            
+            # Warm SPY regime indicators so regime detection is ready immediately
+            self._warm_up_spy_regime()
+        except Exception as e:
+            self.logger.error(f"Failed to add SPY: {e}")
+
+        for ticker in self.config.universe.core_symbols:
+            try:
+                eq = self.add_equity(ticker, Resolution.MINUTE, "USA")
+                eq.set_leverage(1.0)
+                self._core_symbols.append(eq.symbol)
+                self._all_symbols.add(eq.symbol)
+                self._create_indicators_for_symbol(eq.symbol)
+                self.logger.info(f"Added CORE: {ticker}")
+            except Exception as e:
+                self.logger.error(f"Failed to add {ticker}: {e}")
+
+        try:
+            self.add_universe(self._select_universe)
+            self.logger.info("Added dynamic universe")
+        except Exception as e:
+            self.logger.error(f"Failed to add universe: {e}")
+        
+        if self.live_mode:
+            self.logger.critical("LIVE TRADING MODE - Market hours will be enforced")
+        else:
+            self.logger.info("BACKTESTING MODE - Market hours check disabled")
+  
+
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 25), self._detect_market_regime)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 30), self._evaluate_signals_safe)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 35), self._send_portfolio_summary_email)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(12, 0), self._detect_market_regime)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(12, 30), self._evaluate_signals_safe)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(12, 30), self._send_portfolio_summary_email)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(15, 0), self._detect_market_regime)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(15, 30), self._evaluate_signals_safe)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(15, 30), self._send_portfolio_summary_email)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(16, 0), self._daily_risk_summary)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(16, 0), self._send_portfolio_summary_email)
+        self.schedule.on(self.date_rules.every(DayOfWeek.FRIDAY), self.time_rules.at(16, 0), self._send_weekly_summary_email)
+
+        # Option A: Use hour-level global warmup to avoid long daily delays
+        self.set_warm_up(200, Resolution.HOUR)
+        
+        self.logger.info("=" * 60)
+        self.logger.info("PRODUCTION ALGORITHM INITIALIZED")
+        self.logger.info(f"Mode: {self.config.general.mode}")
+        self.logger.info("=" * 60)
+    
+    def _is_market_open(self) -> bool:
+        """Check if US market is currently open - works in backtest AND live"""
+        try:
+            # ✅ Simple time-based check (works for both backtest and live)
+            current_time = self.time.time()
+            market_open = dt_time(9, 30)
+            market_close = dt_time(16, 0)
+            is_weekday = self.time.weekday() < 5  # Monday=0, Friday=4
+            
+            is_open = is_weekday and market_open <= current_time <= market_close
+            
+            # Only log in live mode to reduce backtest logs
+            if not is_open and self.live_mode:
+                self.logger.info(f"Market closed: weekday={is_weekday}, time={current_time}")
+            
+            return is_open
+            
+        except Exception as e:
+            self.logger.error(f"Market check error: {e}")
+            # SAFE DEFAULT: Assume market is open during error
+            return True
+
+    def _evaluate_signals_safe(self) -> None:
+        try:
+            # ✅ RECOMMENDED: Skip market check in backtesting
+            if self.live_mode:
+                # Only enforce market hours in live trading
+                if not self._is_market_open():
+                    self.debug("Market closed - skipping evaluation")
+                    return
+
+            if not self.risk_manager.can_trade():
+                return
+            
+            current_equity = self.portfolio.total_portfolio_value
+            daily_loss = self._starting_cash - current_equity
+            
+            if daily_loss > self.config.risk.max_daily_loss:
+                self.logger.critical(f"DAILY LOSS LIMIT: ${daily_loss:,.2f}")
+                self.risk_manager.emergency_stop("Daily loss limit exceeded")
+                return
+            
+            if current_equity > self.peak_equity:
+                self.peak_equity = current_equity
+            
+            drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0
+            if drawdown > self.config.risk.max_drawdown_pct:
+                self.logger.critical(f"DRAWDOWN LIMIT: {drawdown:.1%}")
+                self.risk_manager.emergency_stop(f"Drawdown: {drawdown:.1%}")
+                return
+            
+            self._evaluate_signals()
+        except Exception as e:
+            self.logger.error(f"Signal evaluation error: {e}")
+    
+    def _daily_risk_summary(self) -> None:
+        if not self._is_market_open():
+            return  # Skip on weekends/holidays
+        try:
+            current_equity = self.portfolio.total_portfolio_value
+            daily_pnl = current_equity - self._starting_cash
+            daily_return = daily_pnl / self._starting_cash
+            self.logger.info(f"Daily: ${current_equity:,.0f} ({daily_return:.2%})")
+        except Exception as e:
+            self.logger.error(f"Daily summary error: {e}")
+    
+    def _detect_market_regime(self) -> None:
+        """
+        Robust market regime detection.
+        Regime = structural trend, not short-term momentum.
+        """
+
+        try:
+            # Skip on weekends/holidays
+            if not self._is_market_open():
+                return
+            # ─────────────────────────────────────────────
+            # Guard: indicators must be ready
+            # ─────────────────────────────────────────────
+            if self.spy_ema_20 is None or self.spy_ema_50 is None or not (self.spy_ema_20.is_ready and self.spy_ema_50.is_ready):
+                return
+
+            spy_price = float(self.securities[self.spy].price)
+            
+            # Track SPY peak for bear market severity calculation
+            if self._spy_peak is None or spy_price > self._spy_peak:
+                self._spy_peak = spy_price
+
+            ema_20 = self.spy_ema_20.current.value
+            ema_50 = self.spy_ema_50.current.value
+
+            ema_20_prev = self.spy_ema_20.previous.value
+
+            # RSI (optional confirmation only)
+            rsi_ready = hasattr(self, "spy_rsi") and self.spy_rsi.is_ready
+            rsi_val = self.spy_rsi.current.value if rsi_ready else None
+
+            previous_regime = self.market_regime
+
+            # ─────────────────────────────────────────────
+            # Structural signals (regime)
+            # ─────────────────────────────────────────────
+            price_above_50 = spy_price > ema_50
+            price_below_50 = spy_price < ema_50
+
+            ema_structure_bull = ema_20 > ema_50
+            ema_structure_bear = ema_20 < ema_50
+
+            # ─────────────────────────────────────────────
+            # Momentum signals (confirmation)
+            # ─────────────────────────────────────────────
+            ema_20_rising = ema_20 > ema_20_prev
+            momentum_bear = (not ema_20_rising) and spy_price < ema_20
+
+            # ─────────────────────────────────────────────
+            # REGIME DECISION LOGIC (with hysteresis)
+            # ─────────────────────────────────────────────
+
+            # ---- BULL REGIME ----
+            if (
+                price_above_50
+                and ema_structure_bull
+            ):
+                self.market_regime = "BULL"
+
+            # ---- BEAR REGIME ----
+            elif (
+                price_below_50
+                and ema_structure_bear
+                and momentum_bear
+            ):
+                self.market_regime = "BEAR"
+
+            # ---- NEUTRAL (transition / chop) ----
+            else:
+                # Hysteresis: don't downgrade strong trends easily
+                if previous_regime == "BULL" and price_above_50:
+                    self.market_regime = "BULL"
+                elif previous_regime == "BEAR" and price_below_50:
+                    self.market_regime = "BEAR"
+                else:
+                    self.market_regime = "NEUTRAL"
+
+            # ─────────────────────────────────────────────
+            # LOGGING
+            # ─────────────────────────────────────────────
+            
+            # Log current stats for debugging "always BULL" issues
+            self.logger.info(
+                f"Regime Scan: {self.market_regime} | "
+                f"Price: {spy_price:.2f} | EMA20: {ema_20:.2f} | EMA50: {ema_50:.2f} | "
+                f"Rising: {ema_20_rising}"
+            )
+
+            if previous_regime != self.market_regime:
+                self.logger.info("=" * 70)
+                self.logger.critical(
+                    f"REGIME CHANGE: {previous_regime} → {self.market_regime}"
+                )
+                self.logger.info(
+                    f"SPY: {spy_price:.2f} | EMA20: {ema_20:.2f} | EMA50: {ema_50:.2f}"
+                )
+                self.logger.info(
+                    f"Struct: EMA20>EMA50={ema_structure_bull} | "
+                    f"Momentum: EMA20 rising={ema_20_rising}"
+                )
+                if rsi_ready:
+                    self.logger.info(f"RSI: {rsi_val:.1f}")
+                self.logger.info("=" * 70)
+
+            # Debug detail (safe from division-by-zero)
+            self.debug("SPY Regime Diagnostics:")
+            try:
+                price_vs_50 = ((spy_price - ema_50) / ema_50 * 100) if abs(ema_50) > 1e-9 else None
+            except Exception:
+                price_vs_50 = None
+            try:
+                ema20_slope = ((ema_20 - ema_20_prev) / ema_20_prev * 100) if abs(ema_20_prev) > 1e-9 else None
+            except Exception:
+                ema20_slope = None
+            try:
+                ema20_vs_50 = ((ema_20 - ema_50) / ema_50 * 100) if abs(ema_50) > 1e-9 else None
+            except Exception:
+                ema20_vs_50 = None
+
+            self.debug(f"  Price vs EMA50: {price_vs_50:+.2f}%" if price_vs_50 is not None else "  Price vs EMA50: n/a")
+            self.debug(f"  EMA20 slope: {ema20_slope:+.2f}%" if ema20_slope is not None else "  EMA20 slope: n/a")
+            self.debug(f"  EMA20 vs EMA50: {ema20_vs_50:+.2f}%" if ema20_vs_50 is not None else "  EMA20 vs EMA50: n/a")
+
+        except Exception as e:
+            self.logger.error(f"Regime detection error: {e}")
+            self.logger.warning(f"Keeping existing regime: {self.market_regime}")
+
+    def _select_universe(self, fundamentals: list) -> list:
+        """Unified modern universe selector - handles coarse + fine in one pass"""
+        if self._last_universe_selection is not None:
+            days_since = (self.time.date() - self._last_universe_selection.date()).days
+            if days_since < 14:
+                return []
+        
+        # Quality filters (coarse + fine combined)
+        quality_stocks = [f for f in fundamentals 
+                         if f.price >= 50.0 
+                         and f.dollar_volume >= 100000000 
+                         and f.volume > 0
+                         and f.has_fundamental_data
+                         and not f.symbol.value.startswith(('SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO', 'XL'))
+                         and f.asset_classification.morningstar_sector_code != MorningstarSectorCode.FINANCIAL_SERVICES
+                         and f.valuation_ratios.pe_ratio > 0 
+                         and f.valuation_ratios.pe_ratio < 100
+                         and f.asset_classification.morningstar_industry_group_code > 0]
+        
+        # Score non-core stocks by momentum
+        momentum_scores = []
+        for stock in quality_stocks:
+            if stock.symbol in self._core_symbols:
+                continue
+            try:
+                price_momentum = stock.valuation_ratios.price_change_1m or 0
+                revenue_growth = stock.operation_ratios.revenue_growth.one_year or 0
+                score = (price_momentum * 0.6 + revenue_growth * 0.4)
+                momentum_scores.append((stock.symbol, score))
+            except:
+                continue
+        
+        # Select top 10 momentum stocks (excluding ACN)
+        momentum_scores.sort(key=lambda x: x[1], reverse=True)
+        selected = [s for s, _ in momentum_scores[:10] if s.value != "ACN"]
+        
+        self._last_universe_selection = self.time
+        return list(set(self._core_symbols + selected))
+    
+    def on_securities_changed(self, changes) -> None:
+        for security in changes.added_securities:
+            symbol = security.symbol
+            # Skip SPY - it's only for regime tracking
+            if symbol == self.spy:
+                continue
+            if symbol not in self._all_symbols:
+                self._dynamic_symbols.add(symbol)
+                self._all_symbols.add(symbol)
+                self._create_indicators_for_symbol(symbol)
+                # Ensure indicators for newly added symbols are warmed immediately
+                self._warm_up_symbol_indicators(symbol, Resolution.HOUR)
+        for security in changes.removed_securities:
+            symbol = security.symbol
+            if symbol not in self._core_symbols and not self.portfolio[symbol].invested:
+                self._dynamic_symbols.discard(symbol)
+                self._all_symbols.discard(symbol)
+    
+    def _create_indicators_for_symbol(self, symbol) -> None:
+        try:
+            # Option A: Revert to HOUR resolution for faster, timely signals
+            self._indicators[symbol] = {
+                'macd': self.macd(symbol, 12, 26, 9, MovingAverageType.EXPONENTIAL, Resolution.HOUR),
+                'rsi': self.rsi(symbol, 14, MovingAverageType.EXPONENTIAL, Resolution.HOUR),
+                'ema_50': self.ema(symbol, 50, Resolution.HOUR),
+                'max_20': self.max(symbol, 20, Resolution.DAILY)  # 20-day high for bear market detection
+            }
+            # Warm newly created indicators using history so they're ready immediately
+            self._warm_up_symbol_indicators(symbol, Resolution.HOUR)
+        except Exception as e:
+            self.logger.error(f"Indicator error {symbol}: {e}")
+    
+    def _is_symbol_ready(self, symbol) -> bool:
+        indicators = self._indicators.get(symbol)
+        if not indicators:
+            return False
+        macd = indicators.get("macd")
+        rsi = indicators.get("rsi")
+        ema_50 = indicators.get("ema_50")
+        max_20 = indicators.get("max_20")
+        return all([macd and macd.is_ready, rsi and rsi.is_ready, ema_50 and ema_50.is_ready, max_20 and max_20.is_ready])
+
+    def _warm_up_symbol_indicators(self, symbol, resolution: Resolution = Resolution.HOUR) -> None:
+        """Warm per-symbol indicators using historical data so they are ready immediately.
+
+        Uses QuantConnect's WarmUpIndicator if available; falls back gracefully.
+        """
+        try:
+            indicators = self._indicators.get(symbol)
+            if not indicators:
+                return
+
+            for key in ["ema_50", "rsi", "macd", "max_20"]:
+                indicator = indicators.get(key)
+                if not indicator:
+                    continue
+                try:
+                    # Prefer pythonic snake_case if available, else use C#-style PascalCase
+                    ind_resolution = Resolution.DAILY if key == "max_20" else resolution
+                    self.warm_up_indicator(symbol, indicator, ind_resolution)
+                except Exception as ie:
+                    self.logger.warning(f"WarmUpIndicator failed for {symbol.value} ({key}): {ie}")
+        except Exception as e:
+            self.logger.error(f"Symbol warmup error {symbol.value}: {e}")
+
+    def _warm_up_spy_regime(self) -> None:
+        """Warm SPY regime indicators (EMA20/EMA50/RSI) using daily data."""
+        try:
+            # properly warm up with history
+            history = self.history(self.spy, 75, Resolution.DAILY)
+            if history.empty:
+                self.logger.warning("SPY History empty for warmup")
+                return
+
+            # Iterate through history to update indicators
+            # history.loc[self.spy] gets the dataframe for the symbol
+            if self.spy not in history.index:
+                 self.logger.warning("SPY not in history index")
+                 return
+                 
+            spy_hist = history.loc[self.spy]
+            for time, row in spy_hist.iterrows():
+                # Check for close price
+                if 'close' in row:
+                    price = row['close']
+                    if self.spy_ema_20: self.spy_ema_20.update(time, price)
+                    if self.spy_ema_50: self.spy_ema_50.update(time, price)
+                    if hasattr(self, "spy_rsi") and self.spy_rsi: 
+                        self.spy_rsi.update(time, price)
+            
+            self.logger.info("SPY regime indicators warmed up via History.")
+                
+        except Exception as e:
+            self.logger.error(f"SPY regime warmup error: {e}")
+    
+    def _calculate_position_size(self, symbol, current_price) -> int:
+        try:
+            available_cash = self.portfolio.cash
+            safe_available = available_cash * 0.75
+            target_value = min(safe_available * 0.85, 6500)
+            if target_value < 4000:
+                return 0
+            # Account for estimated commissions (Interactive Brokers style)
+            qty = int(target_value / current_price)
+            if qty <= 0:
+                return 0
+
+            fee = self._estimate_order_fee(symbol, qty, current_price)
+            total_cost = qty * current_price + fee
+
+            # If fees push us over the target_value, scale down once using the fee-adjusted budget
+            if total_cost > target_value:
+                qty = int((target_value - fee) / current_price)
+                fee = self._estimate_order_fee(symbol, qty, current_price)
+                total_cost = qty * current_price + fee
+
+            return qty if qty > 0 and total_cost >= 4000 else 0
+        except Exception as e:
+            self.logger.error(f"Position sizing error: {e}")
+            return 0
+
+    def _estimate_order_fee(self, symbol, quantity: int, price: float) -> float:
+        """Rough Interactive Brokers-style fee model for sizing calculations.
+
+        Uses per-share pricing with min and max caps to avoid oversizing when cash is tight.
+        This is only for pre-trade sizing; actual fills will use the brokerage fee model.
+        """
+        try:
+            if quantity <= 0 or price <= 0:
+                return 0.0
+
+            trade_value = abs(quantity) * price
+            per_share_fee = 0.0035  # IB tiered typical US stock per-share fee
+            min_fee = 0.35          # Minimum per order
+            max_pct = 0.01          # Cap at 1% of trade value
+
+            fee = per_share_fee * abs(quantity)
+            fee = max(fee, min_fee)
+            fee = min(fee, trade_value * max_pct)
+            return float(fee)
+        except Exception:
+            return 0.0
+    
+    def _evaluate_signals(self) -> None:
+        if self.is_warming_up:
+            self.debug(f"WARMING UP: {self.portfolio.cash}")
+            return
+        
+        # Get all invested positions (exclude SPY - it's only for regime tracking)
+        all_invested = [s for s in self.portfolio.keys() if self.portfolio[s].invested and s != self.spy]
+        
+        # Get ONLY algorithm-managed positions for counting
+        algo_invested = [s for s in all_invested if s in self._algo_managed_positions]
+        
+        # EXIT LOGIC - Only manage algorithmic positions
+        for symbol in algo_invested:  # Changed from all_invested to algo_invested
+            try:
+                if not self.portfolio[symbol].invested:
+                    continue
+                current_price = float(self.securities[symbol].price)
+                if current_price <= 0:
+                    continue
+                avg_entry = self.portfolio[symbol].average_price
+                qty = abs(self.portfolio[symbol].quantity)
+                pnl_pct = (current_price - avg_entry) / avg_entry
+                pnl_dollar = qty * (current_price - avg_entry)
+                held_time = self.time - self.entry_time.get(symbol, self.time)
+                
+                if symbol not in self.highest_price:
+                    self.highest_price[symbol] = current_price
+                else:
+                    self.highest_price[symbol] = max(self.highest_price[symbol], current_price)
+                
+                should_exit = False
+                reason = ""
+                self.debug(f"CHECK {symbol.value}: pnl={pnl_pct:.4f}")
+                
+                # Check if this is a bear market entry
+                is_bear_entry = symbol in self._bear_market_entries
+                
+                # BEAR MARKET POSITIONS: DCA exit strategy based on average cost
+                if is_bear_entry:
+                    # Calculate average cost from DCA entries
+                    if symbol in self._bear_dca_entries and len(self._bear_dca_entries[symbol]) > 0:
+                        total_cost = sum(entry['price'] * entry['qty'] for entry in self._bear_dca_entries[symbol])
+                        total_qty = sum(entry['qty'] for entry in self._bear_dca_entries[symbol])
+                        avg_cost = total_cost / total_qty if total_qty > 0 else avg_entry
+                        dca_pnl_pct = (current_price - avg_cost) / avg_cost
+                        entry_count = len(self._bear_dca_entries[symbol])
+                        
+                        self.debug(f"BEAR DCA CHECK {symbol.value}: {entry_count} entries, avg cost ${avg_cost:.2f}, current ${current_price:.2f}, P&L {dca_pnl_pct:.2%}")
+                    else:
+                        dca_pnl_pct = pnl_pct
+                        avg_cost = avg_entry
+                        entry_count = 1
+                    
+                    # DCA Exit Rules
+                    if dca_pnl_pct <= -0.05:  # Stop loss: -5% from average cost
+                        should_exit, reason = True, "bear_dca_stop_loss"
+                        self.logger.critical(f"BEAR DCA STOP: {symbol.value} at {dca_pnl_pct:.2%} from avg ${avg_cost:.2f}")
+                    elif dca_pnl_pct >= 0.03:  # Take profit: +3% from average cost
+                        should_exit, reason = True, "bear_dca_take_profit"
+                        self.logger.info(f"BEAR DCA PROFIT: {symbol.value} at {dca_pnl_pct:.2%} from avg ${avg_cost:.2f} ({entry_count} entries)")
+                    elif self.market_regime == "BULL" and held_time >= timedelta(hours=12):
+                        should_exit, reason = True, "bear_dca_regime_change"
+                        self.logger.info(f"REGIME TO BULL: Exiting bear DCA {symbol.value} at {dca_pnl_pct:.2%}")
+                    elif held_time >= timedelta(days=21):  # Max hold: 21 days (3 weeks for 3 entries)
+                        should_exit, reason = True, "bear_dca_time_exit"
+                        self.logger.info(f"BEAR DCA TIME EXIT: {symbol.value} held {held_time.days} days")
+                else:
+                    # NORMAL POSITIONS: Original exit rules
+                    if pnl_pct <= -0.03:
+                        should_exit, reason = True, "stop_loss"
+                    elif pnl_pct >= 0.08:
+                        self.debug(f"TAKE PROFIT TRIGGERED: {symbol.value}")
+                        should_exit, reason = True, "take_profit"
+                    elif held_time >= timedelta(hours=30) and pnl_pct >= 0.018:
+                        should_exit, reason = True, "profit_lock"
+                    elif held_time >= timedelta(days=14):
+                        should_exit, reason = True, "time_exit"
+            
+                # ✅ ADD GAP DOWN PROTECTION
+                if pnl_pct <= -0.05:  # If loss exceeds 5% (should never happen with 3% stop)
+                    self.logger.critical(f"GAP DOWN DETECTED: {symbol.value} at {pnl_pct:.2%}")
+                    should_exit, reason = True, "gap_protection"
+            
+                if should_exit:
+                    # Always exit if it's algorithm-managed
+                    self.liquidate(symbol, tag=reason)
+
+                    pnl_dollar = qty * (current_price - avg_entry)
+                    
+                    # For DCA positions, show total P&L
+                    if symbol in self._bear_dca_entries:
+                        entry_count = len(self._bear_dca_entries[symbol])
+                        trade_exit = f"{self.time.strftime('%Y-%m-%d %H:%M')} SELL {symbol.value} (DCA {entry_count} entries) - Qty: {qty} @ ${current_price:.2f} | P&L: ${pnl_dollar:.2f}"
+                    else:
+                        trade_exit = f"{self.time.strftime('%Y-%m-%d %H:%M')} SELL {symbol.value} - Qty: {qty} @ ${current_price:.2f} | P&L: ${pnl_dollar:.2f}"
+                    
+                    self.trade_history.append(trade_exit)
+
+                    self.debug(f"EXIT {symbol.value}: {reason}, P&L ${pnl_dollar:.0f}")
+                    self._algo_managed_positions.discard(symbol)
+                    self._bear_market_entries.discard(symbol)
+                    
+                    # Clean up DCA tracking
+                    if symbol in self._bear_dca_entries:
+                        del self._bear_dca_entries[symbol]
+                    if symbol in self._bear_dca_last_buy:
+                        del self._bear_dca_last_buy[symbol]
+            except Exception as e:
+                self.logger.error(f"Exit error: {e}")
+        
+        # ENTRY LOGIC - Count only algorithm-managed positions
+        current_equity = self.portfolio.total_portfolio_value
+        portfolio_return = (current_equity - self._starting_cash) / self._starting_cash
+            
+        # Dynamic position sizing based on regime and performance
+        if self.market_regime == "BULL" and portfolio_return > 0.02:
+            max_allowed = self.max_positions  # Full capacity when doing well in bull market
+        elif self.market_regime == "BULL":
+            max_allowed = min(3, self.max_positions)  # Reduced in bull but underperforming
+        elif self.market_regime == "NEUTRAL":
+            max_allowed = min(2, self.max_positions)  # Conservative in neutral
+        elif self.market_regime == "BEAR":
+            max_allowed = min(2, self.max_positions)  # Conservative bear market buying
+        else:
+            max_allowed = 1  # Very conservative otherwise
+
+        # COUNT ONLY ALGORITHM-MANAGED POSITIONS
+        algo_position_count = len(algo_invested)
+        
+        if algo_position_count >= max_allowed:
+            self.debug(f"SKIP ENTRY: Max algo positions for {self.market_regime} regime ({algo_position_count}/{max_allowed})")
+            self.debug(f"Current positions - Total: {len(all_invested)}, Algo: {algo_position_count}, Manual: {len(all_invested) - algo_position_count}")
+            return
+            
+        if self.portfolio.cash < 4000:
+            self.debug(f"SKIP ENTRY: insufficient cash ${self.portfolio.cash:.0f}")
+            return
+
+        # Bear market strategy: look for quality stocks at discount
+        if self.market_regime == "BEAR":
+            self._evaluate_bear_market_opportunities(algo_invested, max_allowed)
+            return
+
+        candidates = []
+        self.debug(f"SCANNING {len(self._all_symbols)} symbols for entry")
+        not_ready_symbols = []
+        for symbol in self._all_symbols:
+            try:
+                # Skip SPY - it's only for regime tracking
+                if symbol == self.spy:
+                    continue
+                if self.portfolio[symbol].invested:
+                    continue
+
+                # Track names of symbols whose indicators aren't ready
+                if not self._is_symbol_ready(symbol):
+                    not_ready_symbols.append(symbol.value)
+                    continue
+                indicators = self._indicators.get(symbol)
+                if not indicators:
+                    continue
+                macd = indicators["macd"]
+                rsi = indicators["rsi"]
+                ema_50 = indicators["ema_50"]
+                current_price = float(self.securities[symbol].price)
+                if current_price <= 0:
+                    continue
+                macd_val = macd.current.value
+                macd_sig = macd.signal.current.value
+                rsi_val = rsi.current.value
+                ema_val = ema_50.current.value
+                if macd_val > macd_sig and 45 < rsi_val < 65 and current_price > ema_val:
+                    score = (macd_val - macd_sig) * (rsi_val / 100)
+                    candidates.append((symbol, score))
+            except Exception as e:
+                pass
+        
+        # Log which symbols weren't ready (sample up to 3 for brevity)
+        if not_ready_symbols:
+            sample = ", ".join(not_ready_symbols[:3])
+            self.debug(f"Not ready: {sample} (total {len(not_ready_symbols)})")
+        
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_symbol, _ = candidates[0]
+            current_price = float(self.securities[best_symbol].price)
+            qty = self._calculate_position_size(best_symbol, current_price)
+            if qty > 0:
+                ticket = self.market_order(best_symbol, qty)
+                
+                trade_entry = f"{self.time.strftime('%Y-%m-%d %H:%M')} BUY {best_symbol.value} - Qty: {qty} @ ${current_price:.2f}"
+                self.trade_history.append(trade_entry)
+                
+                if ticket:
+                    self._algo_managed_positions.add(best_symbol)
+                    self.entry_time[best_symbol] = self.time
+                    self.entry_price[best_symbol] = current_price
+                    self.highest_price[best_symbol] = current_price
+                    self.debug(f"BUY {best_symbol.value}: qty={qty}, ${current_price:.2f}")
+    
+    def _evaluate_bear_market_opportunities(self, algo_invested: list, max_allowed: int) -> None:
+        """Bear Market DCA Strategy: Buy in intervals, average down, exit at avg cost + 3%"""
+        # Count unique symbols (not number of positions, since DCA can have multiple entries per symbol)
+        unique_bear_symbols = set([s for s in self._bear_market_entries])
+        
+        if len(unique_bear_symbols) >= max_allowed:
+            self.debug(f"SKIP BEAR ENTRY: Max bear symbols ({len(unique_bear_symbols)}/{max_allowed})")
+            return
+        
+        # ULTRA-CONSERVATIVE: Only enter if SPY has fallen 20%+ from peak (true capitulation)
+        if self._spy_peak is None:
+            self.debug("BEAR MARKET: SPY peak not yet established")
+            return
+            
+        spy_price = float(self.securities[self.spy].price)
+        spy_drawdown = (self._spy_peak - spy_price) / self._spy_peak
+        
+        if spy_drawdown < 0.20:
+            self.debug(f"BEAR MARKET: Not severe enough (SPY down {spy_drawdown:.1%}, need -20%+). Preserving capital.")
+            return
+        
+        self.logger.info(f"BEAR CAPITULATION DETECTED: SPY down {spy_drawdown:.1%} from peak ${self._spy_peak:.2f}")
+        self.debug(f"BEAR MARKET: Scanning for DEEP discount opportunities (20-25% below highs)")
+        
+        # Clear previous scan results
+        self._bear_market_scan_results = []
+        discount_candidates = []
+        
+        for symbol in self._all_symbols:
+            try:
+                if symbol == self.spy:
+                    continue
+                if self.portfolio[symbol].invested:
+                    continue
+                
+                if not self._is_symbol_ready(symbol):
+                    continue
+                
+                indicators = self._indicators.get(symbol)
+                if not indicators:
+                    continue
+                
+                current_price = float(self.securities[symbol].price)
+                if current_price <= 0:
+                    continue
+                
+                # Get 20-day high
+                max_20 = indicators["max_20"]
+                high_20d = max_20.current.value
+                
+                # Calculate discount from 20-day high
+                discount_pct = (high_20d - current_price) / high_20d
+                
+                # ULTRA-CONSERVATIVE: Only buy at 20-25% discount (true capitulation pricing)
+                if not (0.20 <= discount_pct <= 0.25):
+                    continue
+                
+                # Apply stricter technical filters for bear market entries
+                macd = indicators["macd"]
+                rsi = indicators["rsi"]
+                ema_50 = indicators["ema_50"]
+                
+                macd_val = macd.current.value
+                macd_sig = macd.signal.current.value
+                rsi_val = rsi.current.value
+                ema_val = ema_50.current.value
+                
+                # ULTRA-STRICT criteria for bear market:
+                # 1. MACD turning positive (early reversal signal)
+                # 2. RSI deeply oversold but stabilizing (35-50 range - true capitulation)
+                # 3. Price still above long-term support (EMA50)
+                macd_bullish = macd_val > macd_sig
+                rsi_recovering = 35 < rsi_val < 50  # Lower threshold for true capitulation
+                above_support = current_price > ema_val * 0.98  # Allow slight breach
+                
+                if macd_bullish and rsi_recovering and above_support:
+                    # Score based on discount and technical strength
+                    macd_strength = (macd_val - macd_sig)
+                    score = discount_pct * 100 * (rsi_val / 100) * abs(macd_strength)
+                    
+                    candidate = {
+                        'symbol': symbol,
+                        'score': score,
+                        'discount': discount_pct,
+                        'price': current_price,
+                        'high_20d': high_20d,
+                        'rsi': rsi_val,
+                        'macd_strength': macd_strength
+                    }
+                    discount_candidates.append(candidate)
+                    # Track for summary emails
+                    self._bear_market_scan_results.append(candidate)
+                    
+                    self.logger.info(
+                        f"BEAR CAPITULATION OPPORTUNITY: {symbol.value} | "
+                        f"Discount: {discount_pct:.1%} | "
+                        f"Price: ${current_price:.2f} (High: ${high_20d:.2f}) | "
+                        f"RSI: {rsi_val:.1f} | Score: {score:.2f}"
+                    )
+            
+            except Exception as e:
+                self.logger.error(f"Bear eval error {symbol}: {e}")
+                continue
+        
+        if not discount_candidates:
+            self.debug("BEAR MARKET: No deep discount opportunities found (need 20-25% off)")
+            return
+        
+        # Check existing positions for DCA opportunities first
+        for candidate in sorted(discount_candidates, key=lambda x: x['score'], reverse=True):
+            symbol = candidate['symbol']
+            
+            # Check if we already have this position (DCA opportunity)
+            if symbol in self._bear_market_entries:
+                # Check DCA eligibility
+                if symbol not in self._bear_dca_entries:
+                    self._bear_dca_entries[symbol] = []
+                
+                entry_count = len(self._bear_dca_entries[symbol])
+                
+                # Max 3 DCA entries per symbol
+                if entry_count >= 3:
+                    self.debug(f"BEAR DCA: {symbol.value} max entries reached (3/3)")
+                    continue
+                
+                # Check if 7 days have passed since last buy
+                last_buy_time = self._bear_dca_last_buy.get(symbol)
+                if last_buy_time and (self.time - last_buy_time) < timedelta(days=7):
+                    self.debug(f"BEAR DCA: {symbol.value} too soon since last buy")
+                    continue
+                
+                # Execute DCA buy
+                bear_position_size = self._calculate_bear_position_size(symbol, candidate['price'])
+                if bear_position_size > 0:
+                    ticket = self.market_order(symbol, bear_position_size, tag=f"bear_dca_{entry_count+1}")
+                    
+                    if ticket:
+                        # Track DCA entry
+                        self._bear_dca_entries[symbol].append({
+                            'time': self.time,
+                            'price': candidate['price'],
+                            'qty': bear_position_size
+                        })
+                        self._bear_dca_last_buy[symbol] = self.time
+                        
+                        trade_entry = (
+                            f"{self.time.strftime('%Y-%m-%d %H:%M')} BEAR DCA {entry_count+1}/3 {symbol.value} - "
+                            f"Qty: {bear_position_size} @ ${candidate['price']:.2f} | "
+                            f"Discount: {candidate['discount']:.1%}"
+                        )
+                        self.trade_history.append(trade_entry)
+                        
+                        self.logger.info(
+                            f"BEAR DCA ENTRY {entry_count+1}/3: {symbol.value} | "
+                            f"Qty: {bear_position_size} @ ${candidate['price']:.2f}"
+                        )
+                        return  # Only one operation per evaluation
+        
+        # No existing positions to DCA, try new entry
+        best = discount_candidates[0]
+        symbol = best['symbol']
+        
+        # Use smaller position size for initial bear entry
+        bear_position_size = self._calculate_bear_position_size(symbol, best['price'])
+        
+        if bear_position_size > 0:
+            ticket = self.market_order(symbol, bear_position_size, tag="bear_dca_1")
+            
+            if ticket:
+                self._algo_managed_positions.add(symbol)
+                self._bear_market_entries.add(symbol)
+                self.entry_time[symbol] = self.time
+                self.entry_price[symbol] = best['price']
+                self.highest_price[symbol] = best['price']
+                
+                # Initialize DCA tracking
+                self._bear_dca_entries[symbol] = [{
+                    'time': self.time,
+                    'price': best['price'],
+                    'qty': bear_position_size
+                }]
+                self._bear_dca_last_buy[symbol] = self.time
+                
+                trade_entry = (
+                    f"{self.time.strftime('%Y-%m-%d %H:%M')} BEAR DCA 1/3 {symbol.value} - "
+                    f"Qty: {bear_position_size} @ ${best['price']:.2f} | "
+                    f"Discount: {best['discount']:.1%} from ${best['high_20d']:.2f}"
+                )
+                self.trade_history.append(trade_entry)
+                
+                self.logger.info(
+                    f"BEAR DCA ENTRY 1/3: {symbol.value} | "
+                    f"Qty: {bear_position_size} | "
+                    f"Price: ${best['price']:.2f} ({best['discount']:.1%} discount) | "
+                    f"RSI: {best['rsi']:.1f}"
+                )
+    
+    def _calculate_bear_position_size(self, symbol, current_price: float) -> int:
+        """Calculate ultra-conservative position size for bear market entries (50% of normal)"""
+        try:
+            available_cash = self.portfolio.cash
+            safe_available = available_cash * 0.75
+            
+            # Much smaller target for bear market (50% of normal max for safety)
+            target_value = min(safe_available * 0.85, 3500)  # Reduced from 6500
+            
+            if target_value < 2500:  # Higher minimum for bear entries
+                return 0
+            
+            qty = int(target_value / current_price)
+            if qty <= 0:
+                return 0
+
+            fee = self._estimate_order_fee(symbol, qty, current_price)
+            total_cost = qty * current_price + fee
+
+            if total_cost > target_value:
+                qty = int((target_value - fee) / current_price)
+                fee = self._estimate_order_fee(symbol, qty, current_price)
+                total_cost = qty * current_price + fee
+
+            return qty if qty > 0 and total_cost >= 2500 else 0
+        except Exception as e:
+            self.logger.error(f"Bear position sizing error: {e}")
+            return 0
+    
+    def _send_portfolio_summary_email(self) -> None:
+        """Send comprehensive portfolio summary via email"""
+        if self.is_warming_up:
+            return  # Silent return during warmup
+        if not self._is_market_open():
+            return  # Skip on weekends/holidays
+        
+        try:
+            # Portfolio Overview
+            current_equity = self.portfolio.total_portfolio_value
+            total_return = (current_equity - self._starting_cash) / self._starting_cash
+            daily_pnl = current_equity - self._starting_cash
+            
+            # Positions Summary
+            positions_summary = []
+            for symbol, holding in self.portfolio.items():
+                if holding.invested:
+                    current_price = float(self.securities[symbol].price)
+                    avg_entry = holding.average_price
+                    qty = abs(holding.quantity)
+                    pnl = qty * (current_price - avg_entry)
+                    pnl_pct = (current_price - avg_entry) / avg_entry
+                    time_held = self.time - self.entry_time.get(symbol, self.time)
+                    
+                    positions_summary.append({
+                        'symbol': symbol.value,
+                        'qty': qty,
+                        'entry_price': avg_entry,
+                        'current_price': current_price,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'time_held': str(time_held),
+                        'value': qty * current_price
+                    })
+            
+            # Recent Trades (from trade_history deque)
+            recent_trades_summary = list(self.trade_history)[-10:]  # Last 10 trades
+            
+            # Build email body
+            email_body = self._format_summary_email(
+                current_equity=current_equity,
+                total_return=total_return,
+                daily_pnl=daily_pnl,
+                cash_position=self.portfolio.cash,
+                market_regime=self.market_regime,
+                positions=positions_summary,
+                recent_trades=recent_trades_summary,
+                symbols_evaluated=len(self._all_symbols),
+                bear_scan_results=self._bear_market_scan_results
+            )
+            
+            # Send email
+            subject = f"Portfolio Summary - {self.time.strftime('%Y-%m-%d %H:%M')}"
+#            self.email_alerter.send_email(subject, email_body)
+            self.notify.email(address="mayank@mehrotra.co.in", subject=subject, message=email_body)
+            self.logger.info(f"Summary email sent at {self.time}")
+            
+        except Exception as e:
+            self.logger.error(f"Email summary error: {e}")
+
+    def _get_position_stats(self) -> dict:
+        """Get detailed position statistics"""
+        all_positions = [s for s in self.portfolio.keys() if self.portfolio[s].invested]
+        algo_positions = [s for s in all_positions if s in self._algo_managed_positions]
+        manual_positions = [s for s in all_positions if s not in self._algo_managed_positions]
+        
+        return {
+            'total_positions': len(all_positions),
+            'algo_positions': len(algo_positions),
+            'manual_positions': len(manual_positions),
+            'algo_symbols': [s.value for s in algo_positions],
+            'manual_symbols': [s.value for s in manual_positions],
+            'max_algo_allowed': self.max_positions
+        }
+
+    def _format_summary_email(self, current_equity, total_return, daily_pnl, cash_position, 
+                            market_regime, positions, recent_trades, symbols_evaluated, bear_scan_results) -> str:
+        """Format comprehensive summary email"""
+        email = "=" * 70 + "\n"
+        email += "PORTFOLIO SUMMARY\n"
+        email += "=" * 70 + "\n\n"
+        
+        # Portfolio Overview
+        email += "PORTFOLIO OVERVIEW\n"
+        email += "-" * 70 + "\n"
+        email += f"Current Equity:    ${current_equity:,.2f}\n"
+        email += f"Total Return:      {total_return:.2%}\n"
+        email += f"Daily P&L:         ${daily_pnl:,.2f}\n"
+        email += f"Cash Position:     ${cash_position:,.2f}\n\n"
+        
+        # Market Regime
+        email += "MARKET REGIME\n"
+        email += "-" * 70 + "\n"
+        email += f"Regime Status:     {self.market_regime}\n"
+        email += f"Symbols Scanned:   {symbols_evaluated}\n"
+        
+        # Position counts
+        algo_positions = len([s for s in self.portfolio.keys() if self.portfolio[s].invested and s in self._algo_managed_positions])
+        manual_positions = len([s for s in self.portfolio.keys() if self.portfolio[s].invested and s not in self._algo_managed_positions])
+        email += f"Algo Positions:    {algo_positions}/{self.max_positions}\n"
+        email += f"Manual Positions:  {manual_positions}\n\n"
+        
+        # Current Positions - Enhanced to show type
+        email += "OPEN POSITIONS\n"
+        email += "-" * 70 + "\n"
+        if positions:
+            for pos in positions:
+                position_type = "ALGO" if any(s.value == pos['symbol'] and s in self._algo_managed_positions for s in self.portfolio.keys()) else "MANUAL"
+                email += f"{pos['symbol']:<8} | "
+                email += f"Qty: {pos['qty']:<6} | "
+                email += f"Entry: ${pos['entry_price']:<8.2f} | "
+                email += f"Current: ${pos['current_price']:<8.2f} | "
+                email += f"P&L: ${pos['pnl']:<10.2f} ({pos['pnl_pct']:>6.2%}) | "
+                email += f"Type: {position_type:<6} | "
+                email += f"Time: {pos['time_held']}\n"
+        else:
+            email += "No open positions\n"
+        email += "\n"
+        
+        # Recent Trades
+        email += "RECENT TRADES (Last 10)\n"
+        email += "-" * 70 + "\n"
+        if recent_trades:
+            for trade in recent_trades:
+                email += f"{trade}\n"
+        else:
+            email += "No recent trades\n"
+        email += "\n"
+        
+        # Bear Market Scan Results
+        if self.market_regime == "BEAR" and bear_scan_results:
+            email += "BEAR MARKET OPPORTUNITIES SCANNED\n"
+            email += "-" * 70 + "\n"
+            email += f"Found {len(bear_scan_results)} potential discount opportunities:\n\n"
+            for opp in sorted(bear_scan_results, key=lambda x: x['score'], reverse=True)[:5]:
+                email += f"{opp['symbol'].value:<8} | "
+                email += f"Discount: {opp['discount']:>6.1%} | "
+                email += f"Price: ${opp['price']:<8.2f} | "
+                email += f"20D High: ${opp['high_20d']:<8.2f} | "
+                email += f"RSI: {opp['rsi']:<5.1f} | "
+                email += f"Score: {opp['score']:<8.2f}\n"
+            email += "\n"
+        
+        email += "=" * 70 + "\n"
+        email += f"Report Generated: {self.time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        return email
+    
+    def _format_weekly_summary(self) -> str:
+        """Format comprehensive weekly summary with performance analytics"""
+        try:
+            current_equity = self.portfolio.total_portfolio_value
+            total_return = (current_equity - self._starting_cash) / self._starting_cash
+            weekly_pnl = current_equity - self._starting_cash
+            
+            # Calculate weekly performance metrics from trade history
+            total_trades = len(self.trade_history)
+            winning_trade_count = len([t for t in self.trade_history if "SELL" in t and "P&L: $" in t and float(t.split("P&L: $")[1].split()[0]) > 0])
+            losing_trade_count = total_trades - winning_trade_count
+            win_rate = (winning_trade_count / total_trades * 100) if total_trades > 0 else 0
+            
+            # Build comprehensive weekly email
+            email = "=" * 80 + "\n"
+            email += "WEEKLY PORTFOLIO ANALYSIS\n"
+            email += "=" * 80 + "\n\n"
+            
+            # Portfolio Performance
+            email += "PORTFOLIO PERFORMANCE\n"
+            email += "-" * 80 + "\n"
+            email += f"Current Equity:        ${current_equity:,.2f}\n"
+            email += f"Starting Capital:      ${self._starting_cash:,.2f}\n"
+            email += f"Total Return:          {total_return:.2%}\n"
+            email += f"Weekly P&L:            ${weekly_pnl:,.2f}\n"
+            email += f"Cash Available:        ${self.portfolio.cash:,.2f}\n"
+            email += f"Peak Equity:           ${self.peak_equity:,.2f}\n"
+            
+            # Calculate drawdown
+            current_drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0
+            email += f"Current Drawdown:      {current_drawdown:.2%}\n\n"
+            
+            # Bear Market Scan Summary (if applicable)
+            if self.market_regime == "BEAR" and self._bear_market_scan_results:
+                email += "BEAR MARKET ANALYSIS\n"
+                email += "-" * 80 + "\n"
+                email += f"Discount Opportunities: {len(self._bear_market_scan_results)}\n"
+                if self._bear_market_scan_results:
+                    top_discount = max(self._bear_market_scan_results, key=lambda x: x['discount'])
+                    email += f"Top Discount:           {top_discount['symbol'].value} at {top_discount['discount']:.1%} below 20D high\n"
+                    top_score = max(self._bear_market_scan_results, key=lambda x: x['score'])
+                    email += f"Best Opportunity:       {top_score['symbol'].value} (Score: {top_score['score']:.2f})\n"
+                email += "\n"
+            
+            # Trading Statistics  
+            email += "TRADING STATISTICS\n"
+            email += "-" * 80 + "\n"
+            email += f"Total Trades:          {total_trades}\n"
+            email += f"Winning Trades:        {winning_trade_count}\n"
+            email += f"Losing Trades:         {losing_trade_count}\n"
+            email += f"Win Rate:              {win_rate:.1f}%\n"
+            email += f"Market Regime:         {self.market_regime}\n"
+            email += f"Symbols in Universe:   {len(self._all_symbols)}\n"
+            email += f"Active Positions:      {len([s for s in self.portfolio.keys() if self.portfolio[s].invested])}\n\n"
+            
+            # Trading Statistics Detail
+            email += "CURRENT HOLDINGS\n"
+            email += "-" * 80 + "\n"
+            active_positions = []
+            total_position_value = 0
+            
+            for symbol, holding in self.portfolio.items():
+                if holding.invested:
+                    current_price = float(self.securities[symbol].price)
+                    avg_entry = holding.average_price
+                    qty = abs(holding.quantity)
+                    position_value = qty * current_price
+                    pnl = qty * (current_price - avg_entry)
+                    pnl_pct = (current_price - avg_entry) / avg_entry
+                    time_held = self.time - self.entry_time.get(symbol, self.time)
+                    
+                    active_positions.append({
+                        'symbol': symbol.value,
+                        'qty': qty,
+                        'entry_price': avg_entry,
+                        'current_price': current_price,
+                        'position_value': position_value,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'time_held': str(time_held).split('.')[0],  # Remove microseconds
+                        'allocation': position_value / current_equity * 100
+                    })
+                    total_position_value += position_value
+            
+            if active_positions:
+                email += f"{'Symbol':<8} | {'Qty':<6} | {'Entry':<10} | {'Current':<10} | {'Value':<12} | {'P&L':<12} | {'%':<8} | {'Alloc%':<7} | {'Time Held'}\n"
+                email += "-" * 80 + "\n"
+                
+                for pos in sorted(active_positions, key=lambda x: x['pnl'], reverse=True):
+                    email += f"{pos['symbol']:<8} | "
+                    email += f"{pos['qty']:<6} | "
+                    email += f"${pos['entry_price']:<9.2f} | "
+                    email += f"${pos['current_price']:<9.2f} | "
+                    email += f"${pos['position_value']:<11,.0f} | "
+                    email += f"${pos['pnl']:<11,.0f} | "
+                    email += f"{pos['pnl_pct']:<7.2%} | "
+                    email += f"{pos['allocation']:<6.1f}% | "
+                    email += f"{pos['time_held']}\n"
+                    
+                email += f"\nTotal Position Value: ${total_position_value:,.2f} ({total_position_value/current_equity*100:.1f}% of portfolio)\n\n"
+            else:
+                email += "No current holdings\n\n"
+            
+            # Recent Trade History (Last 15 trades)
+            email += "RECENT TRADE HISTORY (Last 15)\n"
+            email += "-" * 80 + "\n"
+            if self.trade_history:
+                for trade in list(self.trade_history)[-15:]:
+                    email += f"{trade}\n"
+            else:
+                email += "No recent trades\n"
+            email += "\n"
+            
+            # Risk Metrics
+            email += "RISK METRICS\n"
+            email += "-" * 80 + "\n"
+            email += f"Maximum Drawdown:      {current_drawdown:.2%}\n"
+            email += f"Cash Allocation:       {(self.portfolio.cash / current_equity * 100):.1f}%\n"
+            email += f"Equity Allocation:     {(total_position_value / current_equity * 100):.1f}%\n"
+            email += f"Risk Per Trade:        ~{(self.config.trading.stop_loss_pct * 100):.1f}%\n"
+            email += f"Max Positions:         {self.max_positions}\n\n"
+            
+            # Bear Market Opportunities Detail (weekly)
+            if self.market_regime == "BEAR" and self._bear_market_scan_results:
+                email += "BEAR MARKET OPPORTUNITIES (Latest Scan)\n"
+                email += "-" * 80 + "\n"
+                email += f"{'Symbol':<8} | {'Discount':<9} | {'Price':<10} | {'20D High':<10} | {'RSI':<6} | {'MACD':<8} | {'Score':<8}\n"
+                email += "-" * 80 + "\n"
+                
+                for opp in sorted(self._bear_market_scan_results, key=lambda x: x['score'], reverse=True)[:10]:
+                    email += f"{opp['symbol'].value:<8} | "
+                    email += f"{opp['discount']:<9.1%} | "
+                    email += f"${opp['price']:<9.2f} | "
+                    email += f"${opp['high_20d']:<9.2f} | "
+                    email += f"{opp['rsi']:<6.1f} | "
+                    email += f"{opp['macd_strength']:<8.4f} | "
+                    email += f"{opp['score']:<8.2f}\n"
+                email += "\n"
+            
+            # Weekly Goals & Notes
+            email += "WEEKLY PERFORMANCE NOTES\n"
+            email += "-" * 80 + "\n"
+            
+            if total_return > 0.05:
+                email += "Strong weekly performance! Portfolio significantly above target.\n"
+            elif total_return > 0.02:
+                email += "Good weekly performance, on track with targets.\n"
+            elif total_return > -0.02:
+                email += "Neutral weekly performance, within acceptable range.\n"
+            else:
+                email += "Poor weekly performance, review risk management.\n"
+                
+            if win_rate > 70:
+                email += "Excellent win rate, strategy performing well.\n"
+            elif win_rate > 50:
+                email += "Acceptable win rate, monitor for consistency.\n"
+            else:
+                email += "Low win rate, consider strategy adjustments.\n"
+                
+            if current_drawdown > 0.05:
+                email += "WARNING: High drawdown detected, consider position sizing review.\n"
+                
+            email += "\n" + "=" * 80 + "\n"
+            email += f"Weekly Report Generated: {self.time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            email += "=" * 80 + "\n"
+            
+            return email
+            
+        except Exception as e:
+            self.logger.error(f"Weekly summary formatting error: {e}")
+            return f"Error generating weekly summary: {e}"
+
+
+    # Keep daily summaries but create a different weekly method
+    def _send_weekly_summary_email(self) -> None:
+        """Send comprehensive weekly portfolio summary"""
+        if self.is_warming_up:
+            return  # Silent return during warmup
+        
+        try:
+            # More detailed weekly analysis
+            email_body = self._format_weekly_summary()
+            subject = f"Weekly Portfolio Summary - {self.time.strftime('%Y-%m-%d')}"
+#            self.email_alerter.send_email(subject, email_body)
+            self.notify.email(address="mayank@mehrotra.co.in", subject=subject, message=email_body)
+            self.logger.info(f"Weekly summary email sent")
+        except Exception as e:
+            self.logger.error(f"Weekly email error: {e}")
+
+    def on_end_of_algorithm(self) -> None:
+        try:
+            # Apply same exit logic as _evaluate_signals instead of blindly liquidating
+            for symbol in list(self._algo_managed_positions):
+                if not self.portfolio[symbol].invested:
+                    continue
+                    
+                try:
+                    current_price = float(self.securities[symbol].price)
+                    if current_price <= 0:
+                        continue
+                        
+                    avg_entry = self.portfolio[symbol].average_price
+                    qty = abs(self.portfolio[symbol].quantity)
+                    pnl_pct = (current_price - avg_entry) / avg_entry
+                    held_time = self.time - self.entry_time.get(symbol, self.time)
+                    
+                    if symbol not in self.highest_price:
+                        self.highest_price[symbol] = current_price
+                    else:
+                        self.highest_price[symbol] = max(self.highest_price[symbol], current_price)
+                    
+                    should_exit = False
+                    reason = ""
+                    
+                    # Check if this is a bear market entry
+                    is_bear_entry = symbol in self._bear_market_entries
+                    
+                    # Apply same exit conditions as in _evaluate_signals
+                    if is_bear_entry:
+                        # DCA exit logic for end of algorithm
+                        if symbol in self._bear_dca_entries and len(self._bear_dca_entries[symbol]) > 0:
+                            total_cost = sum(entry['price'] * entry['qty'] for entry in self._bear_dca_entries[symbol])
+                            total_qty = sum(entry['qty'] for entry in self._bear_dca_entries[symbol])
+                            avg_cost = total_cost / total_qty if total_qty > 0 else avg_entry
+                            dca_pnl_pct = (current_price - avg_cost) / avg_cost
+                        else:
+                            dca_pnl_pct = pnl_pct
+                            avg_cost = avg_entry
+                        
+                        # DCA Exit Rules
+                        if dca_pnl_pct <= -0.05:
+                            should_exit, reason = True, "bear_dca_stop_loss"
+                        elif dca_pnl_pct >= 0.03:
+                            should_exit, reason = True, "bear_dca_take_profit"
+                        elif self.market_regime == "BULL" and held_time >= timedelta(hours=12):
+                            should_exit, reason = True, "bear_dca_regime_change"
+                        elif held_time >= timedelta(days=21):
+                            should_exit, reason = True, "bear_dca_time_exit"
+                    else:
+                        # NORMAL POSITIONS
+                        if pnl_pct <= -0.03:
+                            should_exit, reason = True, "stop_loss"
+                        elif pnl_pct >= 0.08:
+                            should_exit, reason = True, "take_profit"
+                        elif held_time >= timedelta(hours=30) and pnl_pct >= 0.018:
+                            should_exit, reason = True, "profit_lock"
+                        elif held_time >= timedelta(days=14):
+                            should_exit, reason = True, "time_exit"
+                    
+                    # Gap down protection (applies to both types)
+                    if pnl_pct <= -0.05:
+                        self.logger.critical(f"GAP DOWN DETECTED: {symbol.value} at {pnl_pct:.2%}")
+                        should_exit, reason = True, "gap_protection"
+                    
+                    # Only exit if conditions are met
+                    if should_exit:
+                        # Use market_order instead of liquidate
+                        self.market_order(symbol, -qty, tag=f"end_of_algo_{reason}")
+                        
+                        pnl_dollar = qty * (current_price - avg_entry)
+                        
+                        # For DCA positions, show entry count
+                        if symbol in self._bear_dca_entries:
+                            entry_count = len(self._bear_dca_entries[symbol])
+                            trade_exit = f"{self.time.strftime('%Y-%m-%d %H:%M')} SELL {symbol.value} (DCA {entry_count} entries) - Qty: {qty} @ ${current_price:.2f} | P&L: ${pnl_dollar:.2f} | Reason: {reason}"
+                        else:
+                            trade_exit = f"{self.time.strftime('%Y-%m-%d %H:%M')} SELL {symbol.value} - Qty: {qty} @ ${current_price:.2f} | P&L: ${pnl_dollar:.2f} | Reason: {reason}"
+                        
+                        self.trade_history.append(trade_exit)
+                        
+                        self.logger.info(f"END EXIT {symbol.value}: {reason}, P&L ${pnl_dollar:.0f}")
+                        self._algo_managed_positions.discard(symbol)
+                        
+                        # Clean up DCA tracking
+                        if symbol in self._bear_dca_entries:
+                            del self._bear_dca_entries[symbol]
+                        if symbol in self._bear_dca_last_buy:
+                            del self._bear_dca_last_buy[symbol]
+                    else:
+                        self.logger.info(f"HOLDING {symbol.value}: No exit condition met (P&L: {pnl_pct:.2%})")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error processing {symbol.value} at end: {e}")
+
+            final_value = self.portfolio.total_portfolio_value
+            total_return = (final_value - self._starting_cash) / self._starting_cash
+
+            # ✅ ADD: Comprehensive trade summary
+            total_trades = len(self.trade_history)
+            wins = len([t for t in self.trade_history if "SELL" in t and float(t.split("P&L: $")[1].split()[0]) > 0])
+            losses = total_trades - wins
+            win_rate = wins / total_trades if total_trades > 0 else 0
+        
+            self.logger.info("=" * 60)
+            self.logger.critical("FINAL RESULTS")
+            self.logger.info("=" * 60)
+            self.logger.info(f"Starting Capital: ${self._starting_cash:,.0f}")
+            self.logger.info(f"Final Value: ${final_value:,.0f}")
+            self.logger.info(f"Total Return: {total_return:.2%}")
+            self.logger.info(f"Total Trades: {total_trades}")
+            self.logger.info(f"Wins/Losses: {wins}/{losses}")
+            self.logger.info(f"Win Rate: {win_rate:.1%}")
+            self.logger.info(f"Market Regime (Final): {self.market_regime}")
+            self.logger.info("=" * 60)
+        
+            # Log trade details
+            for trade in self.trade_history:
+                self.logger.info(trade)
+            
+        except Exception as e:
+            self.logger.error(f"End error: {e}")
+    
+    def on_data(self, data) -> None:
+        pass
+
