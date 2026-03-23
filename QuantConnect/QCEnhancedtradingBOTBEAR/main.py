@@ -90,11 +90,14 @@ class MayankAlgo_Production(QCAlgorithm):
 
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 25), self._reset_daily_state)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 25), self._detect_market_regime)
-        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 30), self._evaluate_signals_safe)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 35), self._evaluate_signals_safe)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(9, 35), self._send_portfolio_summary_email)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(10, 30), self._evaluate_signals_safe)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(11, 30), self._evaluate_signals_safe)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(12, 0), self._detect_market_regime)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(12, 30), self._evaluate_signals_safe)
-        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(12, 30), self._send_portfolio_summary_email)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(13, 30), self._evaluate_signals_safe)
+        self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(14, 30), self._evaluate_signals_safe)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(15, 0), self._detect_market_regime)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(15, 30), self._evaluate_signals_safe)
         self.schedule.on(self.date_rules.every_day("SPY"), self.time_rules.at(15, 30), self._send_portfolio_summary_email)
@@ -113,10 +116,14 @@ class MayankAlgo_Production(QCAlgorithm):
     def _reset_daily_state(self) -> None:
         """Reset daily tracking at market open — allows trading after previous day's losses."""
         self._daily_open_equity = self.portfolio.total_portfolio_value
-        # Reset risk manager if it was stopped by daily loss (not permanent drawdown)
+        # Reset risk manager daily — prevents permanent lockout after drawdown
         if not self.risk_manager.can_trade():
             self.logger.info(f"DAILY RESET: reopening trading, current equity ${self._daily_open_equity:,.2f}")
             self.risk_manager.state = TradingState.RUNNING
+            # Update peak to current equity to prevent immediate re-trigger of drawdown check
+            if self._daily_open_equity < self.peak_equity * (1 - self.config.risk.max_drawdown_pct * 0.5):
+                self.peak_equity = self._daily_open_equity
+                self.logger.info(f"PEAK RESET: new baseline ${self.peak_equity:,.2f} to prevent lockout")
 
     def _is_market_open(self) -> bool:
         """Check if US market is currently open"""
@@ -353,11 +360,13 @@ class MayankAlgo_Production(QCAlgorithm):
     
     def _create_indicators_for_symbol(self, symbol) -> None:
         try:
-            # Option A: Revert to HOUR resolution for faster, timely signals
+            # HOUR resolution for timely signals
             self._indicators[symbol] = {
                 'macd': self.macd(symbol, 12, 26, 9, MovingAverageType.EXPONENTIAL, Resolution.HOUR),
                 'rsi': self.rsi(symbol, 14, MovingAverageType.EXPONENTIAL, Resolution.HOUR),
                 'ema_50': self.ema(symbol, 50, Resolution.HOUR),
+                'ema_9': self.ema(symbol, 9, Resolution.HOUR),
+                'ema_21': self.ema(symbol, 21, Resolution.HOUR),
                 'volume_sma': self.sma(symbol, 20, Resolution.HOUR, Field.VOLUME),
             }
             # Warm newly created indicators using history so they're ready immediately
@@ -372,19 +381,17 @@ class MayankAlgo_Production(QCAlgorithm):
         macd = indicators.get("macd")
         rsi = indicators.get("rsi")
         ema_50 = indicators.get("ema_50")
-        return all([macd and macd.is_ready, rsi and rsi.is_ready, ema_50 and ema_50.is_ready])
+        ema_9 = indicators.get("ema_9")
+        return all([macd and macd.is_ready, rsi and rsi.is_ready, ema_50 and ema_50.is_ready, ema_9 and ema_9.is_ready])
 
     def _warm_up_symbol_indicators(self, symbol, resolution: Resolution = Resolution.HOUR) -> None:
-        """Warm per-symbol indicators using historical data so they are ready immediately.
-
-        Uses QuantConnect's WarmUpIndicator if available; falls back gracefully.
-        """
+        """Warm per-symbol indicators using historical data so they are ready immediately."""
         try:
             indicators = self._indicators.get(symbol)
             if not indicators:
                 return
 
-            for key in ["ema_50", "rsi", "macd", "volume_sma"]:
+            for key in ["ema_50", "ema_9", "ema_21", "rsi", "macd", "volume_sma"]:
                 indicator = indicators.get(key)
                 if not indicator:
                     continue
@@ -430,8 +437,9 @@ class MayankAlgo_Production(QCAlgorithm):
         try:
             available_cash = self.portfolio.cash
             safe_available = available_cash * 0.75
-            target_value = min(safe_available * 0.85, 6500)
-            if target_value < 4000:
+            # Smaller positions = more diversification, less risk per trade
+            target_value = min(safe_available * 0.60, 5000)
+            if target_value < 3000:
                 return 0
             # Account for estimated commissions (Interactive Brokers style)
             qty = int(target_value / current_price)
@@ -441,13 +449,13 @@ class MayankAlgo_Production(QCAlgorithm):
             fee = self._estimate_order_fee(symbol, qty, current_price)
             total_cost = qty * current_price + fee
 
-            # If fees push us over the target_value, scale down once using the fee-adjusted budget
+            # If fees push us over the target_value, scale down once
             if total_cost > target_value:
                 qty = int((target_value - fee) / current_price)
                 fee = self._estimate_order_fee(symbol, qty, current_price)
                 total_cost = qty * current_price + fee
 
-            return qty if qty > 0 and total_cost >= 4000 else 0
+            return qty if qty > 0 and total_cost >= 3000 else 0
         except Exception as e:
             self.logger.error(f"Position sizing error: {e}")
             return 0
@@ -480,7 +488,8 @@ class MayankAlgo_Production(QCAlgorithm):
         self._evaluate_entries()
 
     def _run_exit_logic(self) -> None:
-        """Process exits for all open positions — runs even during emergency stop."""
+        """Process exits for all open positions — runs even during emergency stop.
+        Includes trailing stop, RSI overbought exit, and regime-aware thresholds."""
         if self.is_warming_up:
             return
         
@@ -491,7 +500,7 @@ class MayankAlgo_Production(QCAlgorithm):
         algo_invested = [s for s in all_invested if s in self._algo_managed_positions]
         
         # EXIT LOGIC - Only manage algorithmic positions
-        for symbol in algo_invested:  # Changed from all_invested to algo_invested
+        for symbol in algo_invested:
             try:
                 if not self.portfolio[symbol].invested:
                     continue
@@ -511,42 +520,63 @@ class MayankAlgo_Production(QCAlgorithm):
                 
                 # Use bear dip-buy parameters for bear-dip positions
                 is_bear_dip = symbol in self._bear_dip_positions
-                sl_pct = self.config.bear_dip_buy.stop_loss_pct if is_bear_dip else 0.03
-                tp_pct = self.config.bear_dip_buy.take_profit_pct if is_bear_dip else 0.08
-                pl_hours = self.config.bear_dip_buy.profit_lock_hours if is_bear_dip else 30
-                pl_min = self.config.bear_dip_buy.profit_lock_min_gain_pct if is_bear_dip else 0.018
-                max_hold = timedelta(days=self.config.bear_dip_buy.max_hold_days) if is_bear_dip else timedelta(days=14)
+                sl_pct = self.config.bear_dip_buy.stop_loss_pct if is_bear_dip else self.config.trading.stop_loss_pct
+                tp_pct = self.config.bear_dip_buy.take_profit_pct if is_bear_dip else self.config.trading.take_profit_pct
+                pl_hours = self.config.bear_dip_buy.profit_lock_hours if is_bear_dip else self.config.trading.profit_lock_hours
+                pl_min = self.config.bear_dip_buy.profit_lock_min_gain_pct if is_bear_dip else self.config.trading.profit_lock_min_gain_pct
+                max_hold = timedelta(days=self.config.bear_dip_buy.max_hold_days) if is_bear_dip else timedelta(days=self.config.trading.max_hold_days)
                 
                 should_exit = False
                 reason = ""
-                self.debug(f"CHECK {symbol.value}: pnl={pnl_pct:.4f} bear_dip={is_bear_dip}")
+                
+                # 1. STOP LOSS
                 if pnl_pct <= -sl_pct:
                     should_exit, reason = True, "stop_loss"
+                
+                # 2. TAKE PROFIT (hard cap)
                 elif pnl_pct >= tp_pct:
-                    self.debug(f"TAKE PROFIT TRIGGERED: {symbol.value}")
                     should_exit, reason = True, "take_profit"
+                
+                # 3. TRAILING STOP — let winners run, lock in gains
+                elif (getattr(self.config.trading, 'trailing_stop_enabled', False)
+                      and pnl_pct >= self.config.trading.trailing_activation_pct):
+                    # Trailing is active — check if price dropped from high
+                    drop_from_high = (self.highest_price[symbol] - current_price) / self.highest_price[symbol]
+                    if drop_from_high >= self.config.trading.trailing_stop_pct:
+                        should_exit, reason = True, f"trailing_stop|high=${self.highest_price[symbol]:.2f}"
+                
+                # 4. PROFIT LOCK — time-based gain lock
                 elif held_time >= timedelta(hours=pl_hours) and pnl_pct >= pl_min:
                     should_exit, reason = True, "profit_lock"
+                
+                # 5. RSI OVERBOUGHT EXIT — sell when extreme momentum exhausted
+                elif pnl_pct > 0.02:  # Only if in decent profit
+                    indicators = self._indicators.get(symbol)
+                    if indicators and indicators.get('rsi') and indicators['rsi'].is_ready:
+                        rsi_val = indicators['rsi'].current.value
+                        if rsi_val > 85:  # Only exit at extreme overbought
+                            should_exit, reason = True, f"rsi_overbought|RSI={rsi_val:.0f}"
+                
+                # 6. TIME EXIT — max hold
                 elif held_time >= max_hold:
                     should_exit, reason = True, "time_exit"
             
-                # ✅ GAP DOWN PROTECTION (tighter: 4% to match 3% stop)
-                if pnl_pct <= -0.04:
+                # 7. GAP DOWN PROTECTION
+                if pnl_pct <= -0.05:
                     self.logger.critical(f"GAP DOWN DETECTED: {symbol.value} at {pnl_pct:.2%}")
                     should_exit, reason = True, "gap_protection"
             
                 if should_exit:
-                    # Always exit if it's algorithm-managed
                     self.liquidate(symbol, tag=reason)
 
                     pnl_dollar = qty * (current_price - avg_entry)
                     trade_exit = f"{self.time.strftime('%Y-%m-%d %H:%M')} SELL {symbol.value} - Qty: {qty} @ ${current_price:.2f} | P&L: ${pnl_dollar:.2f}"
                     self.trade_history.append(trade_exit)
 
-                    self.debug(f"EXIT {symbol.value}: {reason}, P&L ${pnl_dollar:.0f}, bear_dip={is_bear_dip}")
+                    self.debug(f"EXIT {symbol.value}: {reason}, P&L ${pnl_dollar:.0f}, pnl%={pnl_pct:.2%}")
                     self._algo_managed_positions.discard(symbol)
                     self._bear_dip_positions.discard(symbol)
-                    self._bear_dip_scale_in_pending.pop(symbol, None)  # Cancel any pending scale-in
+                    self._bear_dip_scale_in_pending.pop(symbol, None)
             except Exception as e:
                 self.logger.error(f"Exit error: {e}")
 
@@ -596,7 +626,7 @@ class MayankAlgo_Production(QCAlgorithm):
             if bear_dip_count >= bear_max:
                 self.debug(f"SKIP BEAR DIP: max bear positions ({bear_dip_count}/{bear_max})")
                 return
-            if self.portfolio.cash < 4000:
+            if self.portfolio.cash < 3000:
                 self.debug(f"SKIP BEAR DIP: insufficient cash ${self.portfolio.cash:.0f}")
                 return
             
@@ -721,42 +751,39 @@ class MayankAlgo_Production(QCAlgorithm):
             return
             
         # ─────────────────────────────────────────────
-        # BULL / NEUTRAL → standard momentum entries
+        # BULL / NEUTRAL → momentum entries with scoring system
         # ─────────────────────────────────────────────
         # Dynamic position sizing based on regime and performance
-        if self.market_regime == "BULL" and portfolio_return > 0.02:
-            max_allowed = self.max_positions  # Full capacity when doing well in bull market
+        if self.market_regime == "BULL" and portfolio_return > 0.0:
+            max_allowed = self.max_positions  # Full capacity in bull
         elif self.market_regime == "BULL":
-            max_allowed = min(3, self.max_positions)  # Reduced in bull but underperforming
+            max_allowed = min(3, self.max_positions)
         elif self.market_regime == "NEUTRAL":
-            max_allowed = min(2, self.max_positions)  # Conservative in neutral
+            max_allowed = min(3, self.max_positions)  # Allow 3 in neutral too
         else:
-            max_allowed = 1  # Very conservative otherwise
+            max_allowed = 1
 
         # COUNT ONLY ALGORITHM-MANAGED POSITIONS
         algo_position_count = len(algo_invested)
         
         if algo_position_count >= max_allowed:
             self.debug(f"SKIP ENTRY: Max algo positions for {self.market_regime} regime ({algo_position_count}/{max_allowed})")
-            self.debug(f"Current positions - Total: {len(all_invested)}, Algo: {algo_position_count}, Manual: {len(all_invested) - algo_position_count}")
             return
             
-        if self.portfolio.cash < 4000:
+        if self.portfolio.cash < 3000:
             self.debug(f"SKIP ENTRY: insufficient cash ${self.portfolio.cash:.0f}")
             return
 
         candidates = []
-        self.debug(f"SCANNING {len(self._all_symbols)} symbols for entry")
+        self.debug(f"SCANNING {len(self._all_symbols)} symbols for entry | regime={self.market_regime}")
         not_ready_symbols = []
         for symbol in self._all_symbols:
             try:
-                # Skip SPY - it's only for regime tracking
                 if symbol == self.spy:
                     continue
                 if self.portfolio[symbol].invested:
                     continue
 
-                # Track names of symbols whose indicators aren't ready
                 if not self._is_symbol_ready(symbol):
                     not_ready_symbols.append(symbol.value)
                     continue
@@ -766,15 +793,66 @@ class MayankAlgo_Production(QCAlgorithm):
                 macd = indicators["macd"]
                 rsi = indicators["rsi"]
                 ema_50 = indicators["ema_50"]
+                ema_9 = indicators.get("ema_9")
+                ema_21 = indicators.get("ema_21")
+                vol_sma = indicators.get("volume_sma")
                 current_price = float(self.securities[symbol].price)
                 if current_price <= 0:
                     continue
+                
                 macd_val = macd.current.value
                 macd_sig = macd.signal.current.value
                 rsi_val = rsi.current.value
-                ema_val = ema_50.current.value
-                if macd_val > macd_sig and 45 < rsi_val < 65 and current_price > ema_val:
-                    score = (macd_val - macd_sig) * (rsi_val / 100)
+                ema_50_val = ema_50.current.value
+                ema_9_val = ema_9.current.value if ema_9 and ema_9.is_ready else current_price
+                ema_21_val = ema_21.current.value if ema_21 and ema_21.is_ready else ema_50_val
+                
+                # ── SIMPLE MOMENTUM ENTRY ──
+                # Core filter: MACD bullish + price above EMA50
+                if macd_val <= macd_sig:
+                    continue
+                if current_price < ema_50_val:
+                    continue
+                if rsi_val > 75 or rsi_val < 30:
+                    continue  # Skip extremes
+                
+                # Score based on multiple factors
+                score = 0.0
+                
+                # MACD strength
+                macd_diff = macd_val - macd_sig
+                score += min(macd_diff * 100, 3.0)  # Cap at 3 points
+                
+                # RSI sweet spot (40-60 is ideal for entry)
+                if 40 <= rsi_val <= 60:
+                    score += 2.0
+                elif 35 <= rsi_val < 40 or 60 < rsi_val <= 70:
+                    score += 1.0
+                
+                # EMA alignment: 9 > 21 > 50 = strong trend
+                if ema_9_val > ema_21_val > ema_50_val:
+                    score += 2.0
+                elif ema_9_val > ema_50_val:
+                    score += 1.0
+                
+                # Volume confirmation
+                if vol_sma and vol_sma.is_ready:
+                    try:
+                        cur_vol = float(self.securities[symbol].volume)
+                        avg_vol = vol_sma.current.value
+                        if avg_vol > 0 and cur_vol > avg_vol * 1.1:
+                            score += 1.0
+                    except Exception:
+                        pass
+                
+                # Price momentum: how far above EMA50
+                pct_above_ema50 = (current_price - ema_50_val) / ema_50_val
+                if 0 < pct_above_ema50 <= 0.05:
+                    score += 1.0  # Near EMA50 — better entry point
+                elif pct_above_ema50 > 0.10:
+                    score -= 0.5  # Extended — higher risk
+                
+                if score >= 3.0:
                     candidates.append((symbol, score))
             except Exception as e:
                 pass
@@ -786,20 +864,22 @@ class MayankAlgo_Production(QCAlgorithm):
         
         if candidates:
             candidates.sort(key=lambda x: x[1], reverse=True)
-            best_symbol, _ = candidates[0]
-            current_price = float(self.securities[best_symbol].price)
-            qty = self._calculate_position_size(best_symbol, current_price)
-            if qty > 0:
-                ticket = self.market_order(best_symbol, qty)
-                
-                trade_entry = f"{self.time.strftime('%Y-%m-%d %H:%M')} BUY {best_symbol.value} - Qty: {qty} @ ${current_price:.2f}"
-                self.trade_history.append(trade_entry)
-                
-                if ticket:
-                    self._algo_managed_positions.add(best_symbol)
-                    self.entry_time[best_symbol] = self.time
-                    self.highest_price[best_symbol] = current_price
-                    self.debug(f"BUY {best_symbol.value}: qty={qty}, ${current_price:.2f}")
+            # Buy the top candidate(s) up to available slots
+            slots_available = max_allowed - algo_position_count
+            for best_symbol, best_score in candidates[:slots_available]:
+                current_price = float(self.securities[best_symbol].price)
+                qty = self._calculate_position_size(best_symbol, current_price)
+                if qty > 0:
+                    ticket = self.market_order(best_symbol, qty)
+                    
+                    trade_entry = f"{self.time.strftime('%Y-%m-%d %H:%M')} BUY {best_symbol.value} - Qty: {qty} @ ${current_price:.2f} | score={best_score:.1f} | {self.market_regime}"
+                    self.trade_history.append(trade_entry)
+                    
+                    if ticket:
+                        self._algo_managed_positions.add(best_symbol)
+                        self.entry_time[best_symbol] = self.time
+                        self.highest_price[best_symbol] = current_price
+                        self.debug(f"BUY {best_symbol.value}: qty={qty}, ${current_price:.2f}, score={best_score:.1f}")
     
     def _send_portfolio_summary_email(self) -> None:
         """Send comprehensive portfolio summary via email"""
@@ -924,11 +1004,11 @@ class MayankAlgo_Production(QCAlgorithm):
                     
                     # Use bear dip-buy parameters for bear-dip positions
                     is_bear_dip = symbol in self._bear_dip_positions
-                    sl_pct = self.config.bear_dip_buy.stop_loss_pct if is_bear_dip else 0.03
-                    tp_pct = self.config.bear_dip_buy.take_profit_pct if is_bear_dip else 0.08
-                    pl_hours = self.config.bear_dip_buy.profit_lock_hours if is_bear_dip else 30
-                    pl_min = self.config.bear_dip_buy.profit_lock_min_gain_pct if is_bear_dip else 0.018
-                    max_hold = timedelta(days=self.config.bear_dip_buy.max_hold_days) if is_bear_dip else timedelta(days=14)
+                    sl_pct = self.config.bear_dip_buy.stop_loss_pct if is_bear_dip else self.config.trading.stop_loss_pct
+                    tp_pct = self.config.bear_dip_buy.take_profit_pct if is_bear_dip else self.config.trading.take_profit_pct
+                    pl_hours = self.config.bear_dip_buy.profit_lock_hours if is_bear_dip else self.config.trading.profit_lock_hours
+                    pl_min = self.config.bear_dip_buy.profit_lock_min_gain_pct if is_bear_dip else self.config.trading.profit_lock_min_gain_pct
+                    max_hold = timedelta(days=self.config.bear_dip_buy.max_hold_days) if is_bear_dip else timedelta(days=self.config.trading.max_hold_days)
                     
                     # Apply exit conditions with regime-aware thresholds
                     if pnl_pct <= -sl_pct:
@@ -941,7 +1021,7 @@ class MayankAlgo_Production(QCAlgorithm):
                         should_exit, reason = True, "time_exit"
                     
                     # Gap down protection
-                    if pnl_pct <= -0.05:
+                    if pnl_pct <= -0.035:
                         self.logger.critical(f"GAP DOWN DETECTED: {symbol.value} at {pnl_pct:.2%}")
                         should_exit, reason = True, "gap_protection"
                     

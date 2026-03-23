@@ -34,14 +34,14 @@ class BOT_Config:
     # ============================================================
     class risk:
         # Daily loss limit - stop trading if daily loss exceeds this
-        max_daily_loss = 100  # $100 = ~0.9% of starting capital
+        max_daily_loss = 250  # $250 = ~2.3% of starting capital (room for 2-3 normal stops)
         
         # Maximum portfolio drawdown from peak
-        max_drawdown_pct = 0.08  # 8% max drawdown (wider for bear volatility)
+        max_drawdown_pct = 0.15  # 15% max drawdown (give strategy room to work)
         
         # Position sizing
         max_position_size_pct = 0.25  # Max 25% of portfolio per position
-        min_entry_notional = 4000  # Minimum trade size in dollars
+        min_entry_notional = 3000  # Minimum trade size in dollars
         target_position_value = 0.85  # Use 85% of available cash
         
         # Per-symbol limits
@@ -52,27 +52,28 @@ class BOT_Config:
     # TRADING PARAMETERS
     # ============================================================
     class trading:
-        eval_interval_minutes = 180  # ORIGINAL: Every 3 hours (proven)
+        eval_interval_minutes = 60  # Evaluate every hour for more opportunities
         
         # Position management
         max_positions = 4  # Number of concurrent positions
-        min_hold_hours = 24
-        max_hold_days = 14
+        min_hold_hours = 6  # Shorter hold for faster turnover
+        max_hold_days = 20  # Give positions time to work
         
-        # Profit taking (ORIGINAL ORANGE COBRA SETTINGS - 61.90% win rate)
-        stop_loss_pct = 0.03  # 3% stop loss
-        take_profit_pct = 0.08  # 8% take profit (ORIGINAL - proven)
-        profit_lock_hours = 30  # Hold for profit lock (ORIGINAL)
-        profit_lock_min_gain_pct = 0.018  # 1.8% minimum gain
+        # Profit taking - WIDER to let winners run
+        stop_loss_pct = 0.04  # 4% stop loss (room for normal pullbacks)
+        take_profit_pct = 0.10  # 10% take profit (2.5:1 reward:risk)
+        profit_lock_hours = 48  # Lock profit after 2 days
+        profit_lock_min_gain_pct = 0.03  # 3% minimum gain to lock
         
         # Trailing stop
-        trailing_stop_pct = 0.03
-        trailing_activation_pct = 0.04
+        trailing_stop_enabled = True
+        trailing_stop_pct = 0.025  # 2.5% trailing stop once activated
+        trailing_activation_pct = 0.05  # Activate trailing at 5% gain (worst exit = +2.5%)
         
-        # Trading frequency limits (ORIGINAL PROVEN SETTINGS)
-        max_weekly_trades = 2  # ORIGINAL - 2 per week
-        min_days_between_trades = 3  # ORIGINAL - 3 days
-        symbol_cooldown_days = 10  # ORIGINAL - 10 days
+        # Trading frequency limits — RELAXED to allow more trades
+        max_weekly_trades = 6  # Allow up to 6 per week
+        min_days_between_trades = 0  # No cooldown between trades
+        symbol_cooldown_days = 3  # 3-day symbol cooldown (was 10)
     
     # ============================================================
     # BEAR DIP-BUY PARAMETERS (blue-chip discount buying)
@@ -90,11 +91,11 @@ class BOT_Config:
         
         # Position management — tighter exits for bear bounces
         max_positions = 3             # Max 3 bear dip-buy positions
-        stop_loss_pct = 0.04          # 4% stop — tight to cut losers fast
-        take_profit_pct = 0.04        # 4% take profit (lock more winnings quickly in volatile markets)
-        profit_lock_hours = 36        # Lock profit after 36 hours
-        profit_lock_min_gain_pct = 0.02   # 2% min gain to lock
-        max_hold_days = 10            # 10 days max (bear rallies are brief)
+        stop_loss_pct = 0.03          # 3% stop
+        take_profit_pct = 0.05        # 5% take profit (1.67:1 R:R)
+        profit_lock_hours = 24        # Lock profit after 24 hours
+        profit_lock_min_gain_pct = 0.015  # 1.5% min gain to lock
+        max_hold_days = 7             # 7 days max (bear rallies are brief)
         
         # Scan full universe (not just core) for NASDAQ-100 opportunities
         core_only = False
