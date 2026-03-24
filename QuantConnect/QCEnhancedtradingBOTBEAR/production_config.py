@@ -177,7 +177,6 @@ class BOT_Config:
     # ============================================================
     class live:
         # Brokerage settings
-        brokerage = "INTERACTIVE_BROKERS"
         account_type = "CASH"  # CASH only - no margin
         
         # Order settings

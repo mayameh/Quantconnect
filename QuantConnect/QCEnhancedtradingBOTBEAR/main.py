@@ -4,6 +4,8 @@ from collections import defaultdict, deque
 from production_config import BOT_Config, ProductionLogger
 from production_wrapper import RiskManager, TradingState
 from email_helpers import format_summary_email, format_weekly_summary
+from regime_helpers import detect_market_regime
+from bear_dip_helpers import evaluate_bear_dip_entries
 
 class MayankAlgo_Production(QCAlgorithm):
     def initialize(self) -> None:
@@ -20,9 +22,10 @@ class MayankAlgo_Production(QCAlgorithm):
         else:
             self.logger.info("PAPER TRADING MODE")
         
-        self.set_start_date(2020, 1, 1)
+        self.set_start_date(2024, 1, 1)
         self.set_end_date(2025, 12, 28)
         self.set_cash(self.config.general.starting_capital)
+        self.brokerage_name = self.brokerage_name.name if self.brokerage_name else "UnknownBroker"  
         self._starting_cash = self.portfolio.cash
         
         self._core_symbols = []
@@ -191,115 +194,7 @@ class MayankAlgo_Production(QCAlgorithm):
             self.logger.error(f"Daily summary error: {e}")
     
     def _detect_market_regime(self) -> None:
-        """
-        Robust market regime detection.
-        Regime = structural trend, not short-term momentum.
-        """
-
-        try:
-            # Skip on weekends/holidays
-            if not self._is_market_open():
-                return
-            # ─────────────────────────────────────────────
-            # Guard: indicators must be ready
-            # ─────────────────────────────────────────────
-            if self.spy_ema_20 is None or self.spy_ema_50 is None or not (self.spy_ema_20.is_ready and self.spy_ema_50.is_ready):
-                return
-
-            spy_price = float(self.securities[self.spy].price)
-
-            ema_20 = self.spy_ema_20.current.value
-            ema_50 = self.spy_ema_50.current.value
-
-            ema_20_prev = self.spy_ema_20.previous.value
-            ema_50_prev = self.spy_ema_50.previous.value
-
-            # RSI (optional confirmation only)
-            rsi_ready = hasattr(self, "spy_rsi") and self.spy_rsi.is_ready
-            rsi_val = self.spy_rsi.current.value if rsi_ready else None
-
-            previous_regime = self.market_regime
-
-            # ─────────────────────────────────────────────
-            # Structural signals (regime)
-            # ─────────────────────────────────────────────
-            price_above_50 = spy_price > ema_50
-            price_below_50 = spy_price < ema_50
-
-            ema_structure_bull = ema_20 > ema_50
-            ema_structure_bear = ema_20 < ema_50
-
-            # ─────────────────────────────────────────────
-            # Momentum signals (confirmation)
-            # ─────────────────────────────────────────────
-            ema_20_rising = ema_20 > ema_20_prev
-            ema_50_rising = ema_50 > ema_50_prev
-
-            momentum_bull = ema_20_rising and spy_price > ema_20
-            momentum_bear = (not ema_20_rising) and spy_price < ema_20
-
-            rsi_bull = rsi_ready and rsi_val > 55
-            rsi_bear = rsi_ready and rsi_val < 45
-
-            # ─────────────────────────────────────────────
-            # REGIME DECISION LOGIC (with hysteresis)
-            # ─────────────────────────────────────────────
-
-            # ---- BULL REGIME ----
-            if (
-                price_above_50
-                and ema_structure_bull
-            ):
-                self.market_regime = "BULL"
-
-            # ---- EXTREME BEAR REGIME (deep selloff = discount buying opportunity) ----
-            # Simplified: no momentum_bear required — RSI + discount is sufficient
-            elif (
-                price_below_50
-                and ema_structure_bear
-                and rsi_ready
-                and rsi_val < self.config.bear_dip_buy.spy_rsi_threshold
-                and abs(ema_50) > 1e-9
-                and ((ema_50 - spy_price) / ema_50) >= self.config.bear_dip_buy.spy_discount_pct
-            ):
-                self.market_regime = "EXTREME_BEAR"
-
-            # ---- BEAR REGIME ----
-            elif (
-                price_below_50
-                and ema_structure_bear
-                and momentum_bear
-            ):
-                self.market_regime = "BEAR"
-
-            # ---- NEUTRAL (transition / chop) ----
-            else:
-                # Hysteresis: don't downgrade strong trends easily
-                if previous_regime == "BULL" and price_above_50:
-                    self.market_regime = "BULL"
-                elif previous_regime == "BEAR" and price_below_50:
-                    self.market_regime = "BEAR"
-                elif previous_regime == "EXTREME_BEAR" and price_below_50 and rsi_ready and rsi_val < 40:
-                    self.market_regime = "EXTREME_BEAR"
-                else:
-                    self.market_regime = "NEUTRAL"
-
-            # ─────────────────────────────────────────────
-            # LOGGING
-            # ─────────────────────────────────────────────
-            
-            # Log current stats for debugging "always BULL" issues
-            self.logger.info(
-                f"Regime Scan: {self.market_regime} | "
-                f"Price: {spy_price:.2f} | EMA20: {ema_20:.2f} | EMA50: {ema_50:.2f} | "
-                f"Rising: {ema_20_rising}"
-            )
-
-            if previous_regime != self.market_regime:
-                self.logger.critical(f"REGIME CHANGE: {previous_regime} -> {self.market_regime} | SPY {spy_price:.2f} EMA20 {ema_20:.2f} EMA50 {ema_50:.2f}" + (f" RSI {rsi_val:.1f}" if rsi_ready else ""))
-
-        except Exception as e:
-            self.logger.error(f"Regime detection error: {e}")
+        detect_market_regime(self)
 
     def _select_universe(self, fundamentals: list) -> list:
         """Unified modern universe selector - handles coarse + fine in one pass"""
@@ -593,154 +488,9 @@ class MayankAlgo_Production(QCAlgorithm):
         current_equity = self.portfolio.total_portfolio_value
         portfolio_return = (current_equity - self._starting_cash) / self._starting_cash
 
-        # ─────────────────────────────────────────────
         # BEAR / EXTREME BEAR → dip-buy blue-chip discounts
-        # ─────────────────────────────────────────────
         if self.market_regime in ("BEAR", "EXTREME_BEAR") and self.config.bear_dip_buy.enabled:
-            # ── SCALE-IN CHECK: top-up partial positions that are confirming ──
-            if self.config.bear_dip_buy.scale_in_enabled:
-                for sym, info in list(self._bear_dip_scale_in_pending.items()):
-                    try:
-                        if not self.portfolio[sym].invested:
-                            self._bear_dip_scale_in_pending.pop(sym, None)
-                            continue
-                        cp = float(self.securities[sym].price)
-                        gain = (cp - info['entry_price']) / info['entry_price']
-                        held = self.time - self.entry_time.get(sym, self.time)
-                        if gain >= self.config.bear_dip_buy.scale_in_gain_pct and held >= timedelta(hours=self.config.bear_dip_buy.scale_in_min_hours):
-                            add_qty = info['target_qty']
-                            if add_qty > 0 and self.portfolio.cash >= cp * add_qty:
-                                self.market_order(sym, add_qty)
-                                self.trade_history.append(f"{self.time.strftime('%Y-%m-%d %H:%M')} SCALE-IN {sym.value} +{add_qty} @ ${cp:.2f} | gain={gain:.1%}")
-                                self.logger.info(f"BEAR SCALE-IN: {sym.value} +{add_qty} @ ${cp:.2f} gain={gain:.1%}")
-                            self._bear_dip_scale_in_pending.pop(sym, None)
-                        elif gain <= -self.config.bear_dip_buy.stop_loss_pct:
-                            # Stop hit before scale-in — cancel pending
-                            self._bear_dip_scale_in_pending.pop(sym, None)
-                    except Exception:
-                        self._bear_dip_scale_in_pending.pop(sym, None)
-
-            bear_dip_count = len([s for s in algo_invested if s in self._bear_dip_positions])
-            bear_max = self.config.bear_dip_buy.max_positions
-            
-            if bear_dip_count >= bear_max:
-                self.debug(f"SKIP BEAR DIP: max bear positions ({bear_dip_count}/{bear_max})")
-                return
-            if self.portfolio.cash < 3000:
-                self.debug(f"SKIP BEAR DIP: insufficient cash ${self.portfolio.cash:.0f}")
-                return
-            
-            # ── MARKET BREADTH CHECK ──
-            if self.config.bear_dip_buy.breadth_enabled:
-                above_ema_count = 0
-                total_checked = 0
-                for s in self._core_symbols:
-                    ind = self._indicators.get(s)
-                    if ind and ind.get('ema_50') and ind['ema_50'].is_ready:
-                        total_checked += 1
-                        try:
-                            if float(self.securities[s].price) > ind['ema_50'].current.value:
-                                above_ema_count += 1
-                        except Exception:
-                            pass
-                breadth = above_ema_count / total_checked if total_checked > 0 else 0
-                self.debug(f"BREADTH: {above_ema_count}/{total_checked} = {breadth:.1%} above EMA50")
-                if breadth < self.config.bear_dip_buy.min_breadth_pct:
-                    self.debug(f"SKIP BEAR DIP: breadth {breadth:.1%} < min {self.config.bear_dip_buy.min_breadth_pct:.0%}")
-                    return
-
-            # Scan symbols for discount entries
-            scan_symbols = self._core_symbols if self.config.bear_dip_buy.core_only else self._all_symbols
-            bear_candidates = []
-            self.debug(f"BEAR DIP SCAN: {len(scan_symbols)} symbols")
-            
-            for symbol in scan_symbols:
-                try:
-                    if symbol == self.spy or self.portfolio[symbol].invested:
-                        continue
-                    if not self._is_symbol_ready(symbol):
-                        continue
-                    indicators = self._indicators.get(symbol)
-                    if not indicators:
-                        continue
-                    
-                    rsi = indicators["rsi"]
-                    ema_50 = indicators["ema_50"]
-                    vol_sma = indicators.get("volume_sma")
-                    current_price = float(self.securities[symbol].price)
-                    if current_price <= 0:
-                        continue
-                    
-                    rsi_val = rsi.current.value
-                    rsi_prev = rsi.previous.value if rsi.previous else rsi_val
-                    ema_val = ema_50.current.value
-                    
-                    # Oversold + trading at discount to EMA50
-                    if ema_val <= 0:
-                        continue
-                    discount = (ema_val - current_price) / ema_val
-                    
-                    if rsi_val >= self.config.bear_dip_buy.symbol_rsi_max or discount < self.config.bear_dip_buy.symbol_discount_pct:
-                        continue
-                    
-                    # ── BOUNCE CONFIRMATION: RSI must be turning up ──
-                    if self.config.bear_dip_buy.require_bounce and rsi_val <= rsi_prev:
-                        self.debug(f"SKIP {symbol.value}: no bounce (RSI {rsi_prev:.1f}→{rsi_val:.1f})")
-                        continue
-                    
-                    # ── VOLUME CONFIRMATION: current volume > 1.2x average ──
-                    if self.config.bear_dip_buy.require_volume_spike and vol_sma and vol_sma.is_ready:
-                        try:
-                            current_vol = float(self.securities[symbol].volume)
-                            avg_vol = vol_sma.current.value
-                            if avg_vol > 0 and current_vol < avg_vol * self.config.bear_dip_buy.volume_spike_ratio:
-                                self.debug(f"SKIP {symbol.value}: low volume ({current_vol:.0f} < {avg_vol * self.config.bear_dip_buy.volume_spike_ratio:.0f})")
-                                continue
-                        except Exception:
-                            pass  # If volume check fails, allow entry anyway
-                    
-                    # Score: deeper discount + more oversold + stronger bounce = better
-                    bounce_strength = max(0, rsi_val - rsi_prev) / 10.0
-                    score = discount * (1.0 - rsi_val / 100.0) * (1.0 + bounce_strength)
-                    bear_candidates.append((symbol, score, discount, rsi_val))
-                    self.debug(f"BEAR CANDIDATE: {symbol.value} discount={discount:.1%} RSI={rsi_val:.1f} bounce={rsi_val - rsi_prev:+.1f}")
-                except Exception:
-                    pass
-            
-            if bear_candidates:
-                bear_candidates.sort(key=lambda x: x[1], reverse=True)
-                slots_available = bear_max - bear_dip_count
-                for cand_symbol, _, cand_discount, cand_rsi in bear_candidates[:slots_available]:
-                    current_price = float(self.securities[cand_symbol].price)
-                    full_qty = self._calculate_position_size(cand_symbol, current_price)
-                    if full_qty <= 0:
-                        continue
-                    
-                    # ── SCALE-IN: enter with partial size ──
-                    if self.config.bear_dip_buy.scale_in_enabled:
-                        initial_qty = max(1, int(full_qty * self.config.bear_dip_buy.initial_size_pct))
-                        remaining_qty = full_qty - initial_qty
-                    else:
-                        initial_qty = full_qty
-                        remaining_qty = 0
-                    
-                    if initial_qty > 0 and self.portfolio.cash >= current_price * initial_qty:
-                        ticket = self.market_order(cand_symbol, initial_qty)
-                        tag = f"bear_dip|discount={cand_discount:.1%}|RSI={cand_rsi:.0f}|scale={'partial' if remaining_qty > 0 else 'full'}"
-                        trade_entry = f"{self.time.strftime('%Y-%m-%d %H:%M')} BEAR-DIP BUY {cand_symbol.value} - Qty: {initial_qty}/{full_qty} @ ${current_price:.2f} | {tag}"
-                        self.trade_history.append(trade_entry)
-                        self.logger.info(f"BEAR DIP BUY: {cand_symbol.value} {initial_qty}/{full_qty} @ ${current_price:.2f} discount={cand_discount:.1%} RSI={cand_rsi:.0f}")
-                        
-                        if ticket:
-                            self._algo_managed_positions.add(cand_symbol)
-                            self._bear_dip_positions.add(cand_symbol)
-                            self.entry_time[cand_symbol] = self.time
-                            self.highest_price[cand_symbol] = current_price
-                            if remaining_qty > 0:
-                                self._bear_dip_scale_in_pending[cand_symbol] = {
-                                    'target_qty': remaining_qty,
-                                    'entry_price': current_price
-                                }
+            evaluate_bear_dip_entries(self, algo_invested)
             return
         
         # ─────────────────────────────────────────────
@@ -932,7 +682,7 @@ class MayankAlgo_Production(QCAlgorithm):
             )
             
             # Send email via QuantConnect notify
-            subject = f"Portfolio Summary - {self.time.strftime('%Y-%m-%d %H:%M')}"
+            subject = f"[{self.brokerage_name}] Portfolio Summary - {self.time.strftime('%Y-%m-%d %H:%M')}"
             self.notify.email(self.config.monitoring.email_to[0], subject, email_body)
             self.logger.info(f"Summary email sent at {self.time}")
             
@@ -971,7 +721,7 @@ class MayankAlgo_Production(QCAlgorithm):
         try:
             # More detailed weekly analysis
             email_body = self._format_weekly_summary()
-            subject = f"Weekly Portfolio Summary - {self.time.strftime('%Y-%m-%d')}"
+            subject = f"[{self.brokerage_name}] Weekly Portfolio Summary - {self.time.strftime('%Y-%m-%d')}"
             self.notify.email(self.config.monitoring.email_to[0], subject, email_body)
             self.logger.info(f"Weekly summary email sent")
         except Exception as e:

@@ -13,6 +13,10 @@
     "symbol-minute-limit": 10000,
     "symbol-second-limit": 10000,
     "symbol-tick-limit": 10000,
+    "seed-lookback-period": 5,
+    "seed-retry-minute-lookback-period": 1440,
+    "seed-retry-hour-lookback-period": 24,
+    "seed-retry-daily-lookback-period": 10,
     "ignore-unknown-asset-holdings": true,
     "show-missing-data-logs": false,
     "maximum-warmup-history-days-look-back": 5,
@@ -59,6 +63,7 @@
     "binance-api-key": "",
     "binance-api-url": "https://api.binance.com",
     "binance-websocket-url": "wss://stream.binance.com:9443/ws",
+    "binance-orders-websocket-url": "wss://ws-api.binance.com:9443/ws-api/v3",
     "binance-fapi-url": "https://fapi.binance.com",
     "binance-fwebsocket-url": "wss://fstream.binance.com/ws",
     "binance-dapi-url": "https://dapi.binance.com",
@@ -71,6 +76,14 @@
     "bybit-api-key": "",
     "bybit-api-url": "https://api.bybit.com",
     "bybit-websocket-url": "wss://stream.bybit.com",
+    "dydx-private-key-hex": "",
+    "dydx-address": "",
+    "dydx-subaccount-number": 0,
+    "dydx-node-api-rest": "https://dydx-ops-rest.kingnodes.com",
+    "dydx-node-api-grpc": "https://dydx-ops-grpc.kingnodes.com:443",
+    "dydx-indexer-api-rest": "https://indexer.dydx.trade/v4",
+    "dydx-indexer-api-wss": "wss://indexer.dydx.trade/v4/ws",
+    "dydx-chain-id": "dydx-mainnet-1",
     "eze-api-address-url": "",
     "eze-port": "",
     "eze-domain": "",
@@ -611,9 +624,25 @@
                 "BrokerageHistoryProvider",
                 "SubscriptionDataReaderHistoryProvider"
             ]
+        },
+        "live-dydx": {
+            "live-mode": true,
+            "live-mode-brokerage": "dYdXBrokerage",
+            "data-queue-handler": [
+                "dYdXBrokerage"
+            ],
+            "setup-handler": "QuantConnect.Lean.Engine.Setup.BrokerageSetupHandler",
+            "result-handler": "QuantConnect.Lean.Engine.Results.LiveTradingResultHandler",
+            "data-feed-handler": "QuantConnect.Lean.Engine.DataFeeds.LiveTradingDataFeed",
+            "real-time-handler": "QuantConnect.Lean.Engine.RealTime.LiveTradingRealTimeHandler",
+            "transaction-handler": "QuantConnect.Lean.Engine.TransactionHandlers.BrokerageTransactionHandler",
+            "history-provider": [
+                "BrokerageHistoryProvider",
+                "SubscriptionDataReaderHistoryProvider"
+            ]
         }
     },
     "job-organization-id": "f8304c0dc76be85041585d1d5f28569e",
     "organization-id": "f8304c0dc76be85041585d1d5f28569e",
-    "file-database-last-update": "03/22/2026 21:58:33"
+    "file-database-last-update": "03/24/2026 22:39:39"
 }
