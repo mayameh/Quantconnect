@@ -6,6 +6,7 @@ from production_wrapper import RiskManager, TradingState
 from email_helpers import format_summary_email, format_weekly_summary
 from regime_helpers import detect_market_regime
 from bear_dip_helpers import evaluate_bear_dip_entries
+from ai_helpers import MLEntryFilter, AdaptiveExitManager
 
 class MayankAlgo_Production(QCAlgorithm):
     def initialize(self) -> None:
@@ -25,7 +26,7 @@ class MayankAlgo_Production(QCAlgorithm):
         self.set_start_date(2024, 1, 1)
         self.set_end_date(2025, 12, 28)
         self.set_cash(self.config.general.starting_capital)
-        self.brokerage_name = self.brokerage_name.name if self.brokerage_name else "UnknownBroker"  
+        self.broker_label = str(self.brokerage_name) if self.brokerage_name else "UnknownBroker"
         self._starting_cash = self.portfolio.cash
         
         self._core_symbols = []
@@ -47,11 +48,21 @@ class MayankAlgo_Production(QCAlgorithm):
         self.winning_trades = deque(maxlen=30)
         self.losing_trades = deque(maxlen=20)
         self.symbol_performance = defaultdict(lambda: {'trades': 0, 'wins': 0, 'total_pnl': 0.0, 'consecutive_losses': 0, 'win_rate': 0.0})
+        self._consecutive_losses = 0          # global streak counter
+        self._symbol_last_stop = {}            # symbol -> datetime of last stop-loss
+        self._partial_profit_taken = set()     # symbols where 50% was already sold
         
         self.risk_manager = RiskManager(self.logger, self.config)
         self.peak_equity = self._starting_cash
         self._daily_open_equity = self._starting_cash  # Track daily open for proper daily loss calc
         self.max_positions = self.config.trading.max_positions
+
+        # AI components — ML entry filter + adaptive exits
+        self.ml_filter = MLEntryFilter(self, min_trades=20)
+        self.adaptive_exits = AdaptiveExitManager(
+            base_stop_loss=self.config.trading.stop_loss_pct,
+            base_take_profit=self.config.trading.take_profit_pct
+        )
         
         try:
             # Main SPY symbol is critical for scheduling - fail if not added
@@ -263,6 +274,10 @@ class MayankAlgo_Production(QCAlgorithm):
                 'ema_9': self.ema(symbol, 9, Resolution.HOUR),
                 'ema_21': self.ema(symbol, 21, Resolution.HOUR),
                 'volume_sma': self.sma(symbol, 20, Resolution.HOUR, Field.VOLUME),
+                # Daily timeframe confirmation
+                'daily_rsi': self.rsi(symbol, 14, MovingAverageType.EXPONENTIAL, Resolution.DAILY),
+                'daily_ema_20': self.ema(symbol, 20, Resolution.DAILY),
+                'daily_ema_50': self.ema(symbol, 50, Resolution.DAILY),
             }
             # Warm newly created indicators using history so they're ready immediately
             self._warm_up_symbol_indicators(symbol, Resolution.HOUR)
@@ -295,6 +310,16 @@ class MayankAlgo_Production(QCAlgorithm):
                     self.warm_up_indicator(symbol, indicator, resolution)
                 except Exception as ie:
                     self.logger.warning(f"WarmUpIndicator failed for {symbol.value} ({key}): {ie}")
+
+            # Warm daily indicators separately at daily resolution
+            for key in ["daily_rsi", "daily_ema_20", "daily_ema_50"]:
+                indicator = indicators.get(key)
+                if not indicator:
+                    continue
+                try:
+                    self.warm_up_indicator(symbol, indicator, Resolution.DAILY)
+                except Exception as ie:
+                    self.logger.warning(f"WarmUpIndicator daily failed for {symbol.value} ({key}): {ie}")
         except Exception as e:
             self.logger.error(f"Symbol warmup error {symbol.value}: {e}")
 
@@ -415,14 +440,26 @@ class MayankAlgo_Production(QCAlgorithm):
                 
                 # Use bear dip-buy parameters for bear-dip positions
                 is_bear_dip = symbol in self._bear_dip_positions
-                sl_pct = self.config.bear_dip_buy.stop_loss_pct if is_bear_dip else self.config.trading.stop_loss_pct
-                tp_pct = self.config.bear_dip_buy.take_profit_pct if is_bear_dip else self.config.trading.take_profit_pct
+                sl_pct = self.config.bear_dip_buy.stop_loss_pct if is_bear_dip else self.adaptive_exits.get_stop_loss()
+                tp_pct = self.config.bear_dip_buy.take_profit_pct if is_bear_dip else self.adaptive_exits.get_take_profit()
                 pl_hours = self.config.bear_dip_buy.profit_lock_hours if is_bear_dip else self.config.trading.profit_lock_hours
                 pl_min = self.config.bear_dip_buy.profit_lock_min_gain_pct if is_bear_dip else self.config.trading.profit_lock_min_gain_pct
                 max_hold = timedelta(days=self.config.bear_dip_buy.max_hold_days) if is_bear_dip else timedelta(days=self.config.trading.max_hold_days)
                 
                 should_exit = False
                 reason = ""
+                
+                # 0. PARTIAL PROFIT — sell 50% at +4% to lock gains early
+                if (not is_bear_dip
+                        and symbol not in self._partial_profit_taken
+                        and pnl_pct >= 0.04 and qty >= 2):
+                    half_qty = qty // 2
+                    if half_qty > 0:
+                        self.market_order(symbol, -half_qty)
+                        self._partial_profit_taken.add(symbol)
+                        partial_dollar = half_qty * (current_price - avg_entry)
+                        self.debug(f"PARTIAL SELL {symbol.value}: {half_qty} @ ${current_price:.2f}, locked ${partial_dollar:.0f}")
+                        continue  # skip full exit check this cycle
                 
                 # 1. STOP LOSS
                 if pnl_pct <= -sl_pct:
@@ -456,11 +493,6 @@ class MayankAlgo_Production(QCAlgorithm):
                 elif held_time >= max_hold:
                     should_exit, reason = True, "time_exit"
             
-                # 7. GAP DOWN PROTECTION
-                if pnl_pct <= -0.05:
-                    self.logger.critical(f"GAP DOWN DETECTED: {symbol.value} at {pnl_pct:.2%}")
-                    should_exit, reason = True, "gap_protection"
-            
                 if should_exit:
                     self.liquidate(symbol, tag=reason)
 
@@ -469,9 +501,25 @@ class MayankAlgo_Production(QCAlgorithm):
                     self.trade_history.append(trade_exit)
 
                     self.debug(f"EXIT {symbol.value}: {reason}, P&L ${pnl_dollar:.0f}, pnl%={pnl_pct:.2%}")
+                    # Track consecutive losses & symbol performance
+                    if pnl_pct > 0:
+                        self._consecutive_losses = 0
+                        self.symbol_performance[symbol]['wins'] += 1
+                        self.symbol_performance[symbol]['consecutive_losses'] = 0
+                    else:
+                        self._consecutive_losses += 1
+                        self.symbol_performance[symbol]['consecutive_losses'] += 1
+                    self.symbol_performance[symbol]['trades'] += 1
+                    self.symbol_performance[symbol]['total_pnl'] += pnl_pct
+                    if reason.startswith('stop_loss'):
+                        self._symbol_last_stop[symbol] = self.time
+                    # Feed outcome to AI components
+                    self.ml_filter.record_exit(symbol, pnl_pct)
+                    self.adaptive_exits.record_trade(pnl_pct, reason.split('|')[0])
                     self._algo_managed_positions.discard(symbol)
                     self._bear_dip_positions.discard(symbol)
                     self._bear_dip_scale_in_pending.pop(symbol, None)
+                    self._partial_profit_taken.discard(symbol)
             except Exception as e:
                 self.logger.error(f"Exit error: {e}")
 
@@ -524,6 +572,11 @@ class MayankAlgo_Production(QCAlgorithm):
             self.debug(f"SKIP ENTRY: insufficient cash ${self.portfolio.cash:.0f}")
             return
 
+        # Consecutive-loss pause: reduce capacity after streak
+        if self._consecutive_losses >= 3:
+            max_allowed = min(1, max_allowed)
+            self.debug(f"LOSS STREAK: {self._consecutive_losses} consecutive losses, limiting to 1 position")
+
         candidates = []
         self.debug(f"SCANNING {len(self._all_symbols)} symbols for entry | regime={self.market_regime}")
         not_ready_symbols = []
@@ -532,6 +585,16 @@ class MayankAlgo_Production(QCAlgorithm):
                 if symbol == self.spy:
                     continue
                 if self.portfolio[symbol].invested:
+                    continue
+
+                # Symbol cooldown: 5-day ban after a stop-loss
+                last_stop = self._symbol_last_stop.get(symbol)
+                if last_stop and (self.time - last_stop).days < 5:
+                    continue
+
+                # Symbol blacklist: skip after 2+ consecutive losses
+                sym_perf = self.symbol_performance.get(symbol)
+                if sym_perf and sym_perf['consecutive_losses'] >= 2:
                     continue
 
                 if not self._is_symbol_ready(symbol):
@@ -563,8 +626,19 @@ class MayankAlgo_Production(QCAlgorithm):
                     continue
                 if current_price < ema_50_val:
                     continue
-                if rsi_val > 75 or rsi_val < 30:
+                if rsi_val > 80 or rsi_val < 25:
                     continue  # Skip extremes
+                
+                # Daily timeframe confirmation — reject entries against daily trend
+                daily_rsi = indicators.get('daily_rsi')
+                daily_ema20 = indicators.get('daily_ema_20')
+                daily_ema50 = indicators.get('daily_ema_50')
+                if daily_ema20 and daily_ema50 and daily_ema20.is_ready and daily_ema50.is_ready:
+                    if daily_ema20.current.value < daily_ema50.current.value:
+                        continue  # Daily trend is bearish — skip
+                if daily_rsi and daily_rsi.is_ready:
+                    if daily_rsi.current.value > 80 or daily_rsi.current.value < 30:
+                        continue  # Daily RSI extreme — skip
                 
                 # Score based on multiple factors
                 score = 0.0
@@ -573,10 +647,10 @@ class MayankAlgo_Production(QCAlgorithm):
                 macd_diff = macd_val - macd_sig
                 score += min(macd_diff * 100, 3.0)  # Cap at 3 points
                 
-                # RSI sweet spot (40-60 is ideal for entry)
-                if 40 <= rsi_val <= 60:
+                # RSI sweet spot (35-65 is ideal for entry)
+                if 35 <= rsi_val <= 65:
                     score += 2.0
-                elif 35 <= rsi_val < 40 or 60 < rsi_val <= 70:
+                elif 25 <= rsi_val < 35 or 65 < rsi_val <= 75:
                     score += 1.0
                 
                 # EMA alignment: 9 > 21 > 50 = strong trend
@@ -585,15 +659,19 @@ class MayankAlgo_Production(QCAlgorithm):
                 elif ema_9_val > ema_50_val:
                     score += 1.0
                 
-                # Volume confirmation
+                # Volume confirmation (REQUIRED — no volume = no trade)
+                has_volume = False
                 if vol_sma and vol_sma.is_ready:
                     try:
                         cur_vol = float(self.securities[symbol].volume)
                         avg_vol = vol_sma.current.value
                         if avg_vol > 0 and cur_vol > avg_vol * 1.1:
                             score += 1.0
+                            has_volume = True
                     except Exception:
                         pass
+                if not has_volume:
+                    continue  # Skip entries without volume confirmation
                 
                 # Price momentum: how far above EMA50
                 pct_above_ema50 = (current_price - ema_50_val) / ema_50_val
@@ -602,8 +680,13 @@ class MayankAlgo_Production(QCAlgorithm):
                 elif pct_above_ema50 > 0.10:
                     score -= 0.5  # Extended — higher risk
                 
-                if score >= 3.0:
-                    candidates.append((symbol, score))
+                # ML quality adjustment (learns from completed trades)
+                ml_features = self.ml_filter.extract_features(symbol)
+                ml_adj = self.ml_filter.get_score_adjustment(ml_features)
+                score += ml_adj
+                
+                if score >= 3.5:
+                    candidates.append((symbol, score, ml_features))
             except Exception as e:
                 pass
         
@@ -616,20 +699,22 @@ class MayankAlgo_Production(QCAlgorithm):
             candidates.sort(key=lambda x: x[1], reverse=True)
             # Buy the top candidate(s) up to available slots
             slots_available = max_allowed - algo_position_count
-            for best_symbol, best_score in candidates[:slots_available]:
+            for best_symbol, best_score, best_ml_features in candidates[:slots_available]:
                 current_price = float(self.securities[best_symbol].price)
                 qty = self._calculate_position_size(best_symbol, current_price)
                 if qty > 0:
                     ticket = self.market_order(best_symbol, qty)
                     
-                    trade_entry = f"{self.time.strftime('%Y-%m-%d %H:%M')} BUY {best_symbol.value} - Qty: {qty} @ ${current_price:.2f} | score={best_score:.1f} | {self.market_regime}"
+                    ml_tag = f" ml={self.ml_filter.get_score_adjustment(best_ml_features):+.1f}" if self.ml_filter.trained else ""
+                    trade_entry = f"{self.time.strftime('%Y-%m-%d %H:%M')} BUY {best_symbol.value} - Qty: {qty} @ ${current_price:.2f} | score={best_score:.1f}{ml_tag} | {self.market_regime}"
                     self.trade_history.append(trade_entry)
                     
                     if ticket:
                         self._algo_managed_positions.add(best_symbol)
                         self.entry_time[best_symbol] = self.time
                         self.highest_price[best_symbol] = current_price
-                        self.debug(f"BUY {best_symbol.value}: qty={qty}, ${current_price:.2f}, score={best_score:.1f}")
+                        self.ml_filter.record_entry(best_symbol, best_ml_features)
+                        self.debug(f"BUY {best_symbol.value}: qty={qty}, ${current_price:.2f}, score={best_score:.1f}{ml_tag}")
     
     def _send_portfolio_summary_email(self) -> None:
         """Send comprehensive portfolio summary via email"""
@@ -682,7 +767,8 @@ class MayankAlgo_Production(QCAlgorithm):
             )
             
             # Send email via QuantConnect notify
-            subject = f"[{self.brokerage_name}] Portfolio Summary - {self.time.strftime('%Y-%m-%d %H:%M')}"
+            subject = f"[{self.broker_label}] Portfolio Summary - {self.time.strftime('%Y-%m-%d %H:%M')}"
+            self.log(f"EMAIL >>> {subject}\n{email_body}")
             self.notify.email(self.config.monitoring.email_to[0], subject, email_body)
             self.logger.info(f"Summary email sent at {self.time}")
             
@@ -721,7 +807,8 @@ class MayankAlgo_Production(QCAlgorithm):
         try:
             # More detailed weekly analysis
             email_body = self._format_weekly_summary()
-            subject = f"[{self.brokerage_name}] Weekly Portfolio Summary - {self.time.strftime('%Y-%m-%d')}"
+            subject = f"[{self.broker_label}] Weekly Portfolio Summary - {self.time.strftime('%Y-%m-%d')}"
+            self.log(f"EMAIL >>> {subject}\n{email_body}")
             self.notify.email(self.config.monitoring.email_to[0], subject, email_body)
             self.logger.info(f"Weekly summary email sent")
         except Exception as e:

@@ -17,6 +17,8 @@ cd ~/Library/CloudStorage/OneDrive-Personal/Mayank/Quantconnect
 git add -A
 git commit -m "Bear dip-buy strategy: NASDAQ-100 universe, bounce/volume/breadth filters, scale-in, optimized exits"
 git push -u origin main
+git push -u Quantconnect main
+
 
 Your origin is using SSH (which is failing), but Quantconnect remote is HTTPS (which will work). Two options:
 

@@ -57,23 +57,24 @@ class BOT_Config:
         # Position management
         max_positions = 4  # Number of concurrent positions
         min_hold_hours = 6  # Shorter hold for faster turnover
-        max_hold_days = 20  # Give positions time to work
+        max_hold_days = 14  # Cut stale positions faster
         
-        # Profit taking - WIDER to let winners run
-        stop_loss_pct = 0.04  # 4% stop loss (room for normal pullbacks)
-        take_profit_pct = 0.10  # 10% take profit (2.5:1 reward:risk)
-        profit_lock_hours = 48  # Lock profit after 2 days
-        profit_lock_min_gain_pct = 0.03  # 3% minimum gain to lock
+        # Profit taking - tuned for better win/loss asymmetry
+        stop_loss_pct = 0.03  # 3% stop loss (cut losses fast, match avg win size)
+        take_profit_pct = 0.08  # 8% take profit (2.67:1 reward:risk)
+        profit_lock_hours = 72  # Lock profit after 3 days (give trades room)
+        profit_lock_min_gain_pct = 0.05  # 5% minimum gain to lock (don't cut winners early)
         
-        # Trailing stop
+        # Trailing stop — primary winner management tool
         trailing_stop_enabled = True
-        trailing_stop_pct = 0.025  # 2.5% trailing stop once activated
-        trailing_activation_pct = 0.05  # Activate trailing at 5% gain (worst exit = +2.5%)
+        trailing_stop_pct = 0.03  # 3% trailing stop (wider to avoid shakeouts)
+        trailing_activation_pct = 0.04  # Activate at 4% gain (worst exit = +1%)
         
         # Trading frequency limits — RELAXED to allow more trades
-        max_weekly_trades = 6  # Allow up to 6 per week
+        max_weekly_trades = 8  # Allow up to 8 per week
         min_days_between_trades = 0  # No cooldown between trades
-        symbol_cooldown_days = 3  # 3-day symbol cooldown (was 10)
+        symbol_cooldown_days = 2  # 2-day symbol cooldown (faster re-entry)
+        symbol_cooldown_after_stop = 5  # 5-day cooldown after stop-loss on same symbol
     
     # ============================================================
     # BEAR DIP-BUY PARAMETERS (blue-chip discount buying)

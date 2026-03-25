@@ -644,5 +644,6 @@
     },
     "job-organization-id": "f8304c0dc76be85041585d1d5f28569e",
     "organization-id": "f8304c0dc76be85041585d1d5f28569e",
-    "file-database-last-update": "03/24/2026 22:39:39"
+    "file-database-last-update": "03/24/2026 22:39:39",
+    "alpaca-environment": "live"
 }

@@ -27,7 +27,7 @@ def format_summary_email(algo) -> str:
 
     e = "=" * 70 + "\nPORTFOLIO SUMMARY\n" + "=" * 70 + "\n\n"
     e += "PORTFOLIO OVERVIEW\n" + "-" * 70 + "\n"
-    e += f"Brokerage:          {algo.brokerage_name}\n"
+    e += f"Brokerage:          {algo.broker_label}\n"
     e += f"Current Equity:    ${current_equity:,.2f}\n"
     e += f"Total Return:      {total_return:.2%}\n"
     e += f"Daily P&L:         ${daily_pnl:,.2f}\n"
@@ -72,7 +72,7 @@ def format_weekly_summary(algo) -> str:
 
         e = "=" * 80 + "\nWEEKLY PORTFOLIO ANALYSIS\n" + "=" * 80 + "\n\n"
         e += "PORTFOLIO PERFORMANCE\n" + "-" * 80 + "\n"
-        e += f"Brokerage:            {algo.brokerage_name}\n"
+        e += f"Brokerage:            {algo.broker_label}\n"
         e += f"Current Equity:        ${ce:,.2f}\n"
         e += f"Starting Capital:      ${algo._starting_cash:,.2f}\n"
         e += f"Total Return:          {tr:.2%}\n"
