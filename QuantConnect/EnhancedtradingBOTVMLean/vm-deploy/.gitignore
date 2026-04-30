@@ -1,0 +1,9 @@
+# Ignore secrets
+.env
+.env.bot
+*.pem
+*.key
+venv/
+__pycache__/
+*.pyc
+logs/

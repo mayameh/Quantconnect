@@ -1,0 +1,16 @@
+# Core
+ib_insync>=0.9.86
+pandas>=2.0
+pandas_ta>=0.3.14b
+requests>=2.31
+yfinance>=0.2.28  # Historical data for backtesting
+
+# Scheduling
+APScheduler>=3.10,<4.0
+
+# Timezone support
+pytz>=2024.1
+tzdata>=2024.1
+
+# Optional: for enhanced logging / monitoring
+python-dotenv>=1.0

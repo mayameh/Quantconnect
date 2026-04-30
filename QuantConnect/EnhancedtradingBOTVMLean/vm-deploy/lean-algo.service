@@ -1,0 +1,26 @@
+[Unit]
+Description=LEAN Trading Engine (live with IB Gateway)
+After=ibgateway.service
+Requires=ibgateway.service
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/lean-trading
+
+# Docker Compose approach
+ExecStart=/usr/bin/docker compose -f /opt/lean-trading/docker-compose.yml up lean
+ExecStop=/usr/bin/docker compose -f /opt/lean-trading/docker-compose.yml down lean
+
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+# Logging
+StandardOutput=append:/opt/lean-trading/logs/lean-engine.log
+StandardError=append:/opt/lean-trading/logs/lean-engine-error.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=IB Gateway (headless via IBC + Xvfb)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+
+# Virtual framebuffer for headless Java Swing GUI
+Environment=DISPLAY=:1
+Environment=IBC_INI=/opt/lean-trading/config/ibc-config.ini
+Environment=TWS_MAJOR_VRSN=10.30
+Environment=IBC_PATH=/opt/ibc
+Environment=TWS_PATH=/opt/ibgateway
+
+# Start Xvfb in background, then IBC
+ExecStartPre=/usr/bin/Xvfb :1 -screen 0 1024x768x24 -nolisten tcp &
+ExecStart=/opt/ibc/gatewaystart.sh -inline
+
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=append:/opt/lean-trading/logs/ibgateway.log
+StandardError=append:/opt/lean-trading/logs/ibgateway-error.log
+
+[Install]
+WantedBy=multi-user.target

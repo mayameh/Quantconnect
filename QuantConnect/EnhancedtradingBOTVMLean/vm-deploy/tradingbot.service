@@ -1,0 +1,29 @@
+[Unit]
+Description=Trading Bot (ib_insync → IB Gateway)
+After=network-online.target ibgateway.service
+Wants=network-online.target
+Requires=ibgateway.service
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/ibtrade/trading/tradingbot
+
+# Credentials via environment (never hardcode)
+EnvironmentFile=/home/ibtrade/trading/tradingbot/.env
+
+ExecStart=/home/ibtrade/trading/tradingbot/venv/bin/python3 /home/ibtrade/trading/tradingbot/main_ib.py
+
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging to journald (also logged to file by the bot itself)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradingbot
+
+[Install]
+WantedBy=multi-user.target

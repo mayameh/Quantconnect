@@ -1,0 +1,84 @@
+# ==============================================================================
+# Docker Compose — IB Gateway (headless) + LEAN Engine
+# ==============================================================================
+#
+# Usage:
+#   docker compose up -d           # start both services
+#   docker compose logs -f lean    # tail LEAN logs
+#   docker compose down            # stop everything
+#
+# Environment variables (set in .env or export):
+#   IB_LOGIN_ID, IB_PASSWORD, IB_ACCOUNT, IB_TRADING_MODE (paper|live)
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------
+  # IB Gateway + IBC (headless via Xvfb)
+  # ----------------------------------------------------------------
+  ibgateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ibgateway
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${IB_LOGIN_ID}
+      TWS_PASSWORD: ${IB_PASSWORD}
+      TRADING_MODE: ${IB_TRADING_MODE:-paper}
+      TWS_PORT: ${IB_PORT:-4002}
+      VNC_SERVER_PASSWORD: ${VNC_PASSWORD:-headless}
+      READ_ONLY_API: "no"
+      TWOFA_TIMEOUT_ACTION: restart
+      AUTO_RESTART_TIME: "11:59 PM"
+      RELOGIN_AFTER_2FA_TIMEOUT: "yes"
+    ports:
+      - "4001:4001"   # IB API live
+      - "4002:4002"   # IB API paper
+      - "5900:5900"   # VNC (for debugging — disable in production)
+    volumes:
+      - ibgateway-data:/opt/ibgateway
+    networks:
+      - trading
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "${IB_PORT:-4002}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ----------------------------------------------------------------
+  # QuantConnect LEAN Engine
+  # ----------------------------------------------------------------
+  lean:
+    image: quantconnect/lean:${LEAN_TAG:-latest}
+    container_name: lean-engine
+    restart: unless-stopped
+    depends_on:
+      ibgateway:
+        condition: service_healthy
+    environment:
+      # Override lean.json IB settings via env
+      QC_IB_ACCOUNT: ${IB_ACCOUNT}
+      QC_IB_USER_NAME: ${IB_LOGIN_ID}
+      QC_IB_PASSWORD: ${IB_PASSWORD}
+      QC_IB_TRADING_MODE: ${IB_TRADING_MODE:-paper}
+      QC_IB_HOST: ibgateway
+      QC_IB_PORT: ${IB_PORT:-4002}
+    volumes:
+      - ./algo:/Lean/Launcher/bin/Debug/Algorithms:ro
+      - ./config/lean.json:/Lean/Launcher/bin/Debug/config.json:ro
+      - ./data:/Data
+      - ./results:/Results
+      - ./logs:/Logs
+    networks:
+      - trading
+    entrypoint: >
+      mono QuantConnect.Lean.Launcher.exe
+      --algorithm-type-name "MayankAlgo_Production"
+      --algorithm-language Python
+      --algorithm-location "/Lean/Launcher/bin/Debug/Algorithms/main.py"
+
+volumes:
+  ibgateway-data:
+
+networks:
+  trading:
+    driver: bridge

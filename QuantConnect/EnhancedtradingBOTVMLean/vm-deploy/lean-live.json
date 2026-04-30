@@ -1,0 +1,74 @@
+{
+    "//": "============================================================",
+    "//": "LEAN Live Trading with IB Gateway (headless)",
+    "//": "============================================================",
+
+    "environment": "live-interactive-brokers",
+    "algorithm-type-name": "MayankAlgo_Production",
+    "algorithm-language": "Python",
+    "algorithm-location": "../Algorithms/main.py",
+
+    "data-folder": "/Data",
+    "results-destination-folder": "/Results",
+
+    "log-handler": "QuantConnect.Logging.CompositeLogHandler",
+    "messaging-handler": "QuantConnect.Messaging.Messaging",
+    "job-queue-handler": "QuantConnect.Queues.JobQueue",
+    "api-handler": "QuantConnect.Api.Api",
+    "map-file-provider": "QuantConnect.Data.Auxiliary.LocalDiskMapFileProvider",
+    "factor-file-provider": "QuantConnect.Data.Auxiliary.LocalDiskFactorFileProvider",
+    "data-provider": "QuantConnect.Lean.Engine.DataFeeds.DefaultDataProvider",
+    "data-channel-provider": "DataChannelProvider",
+    "object-store": "QuantConnect.Lean.Engine.Storage.LocalObjectStore",
+    "data-aggregator": "QuantConnect.Lean.Engine.DataFeeds.AggregationManager",
+
+    "symbol-minute-limit": 10000,
+    "symbol-second-limit": 10000,
+    "symbol-tick-limit": 10000,
+    "seed-lookback-period": 5,
+    "ignore-unknown-asset-holdings": true,
+    "show-missing-data-logs": false,
+    "maximum-warmup-history-days-look-back": 5,
+    "maximum-data-points-per-chart-series": 1000000,
+    "maximum-chart-series": 30,
+    "force-exchange-always-open": false,
+
+    "//": "============================================================",
+    "//": "Interactive Brokers Configuration",
+    "//": "============================================================",
+    "ib-account": "",
+    "ib-user-name": "",
+    "ib-password": "",
+    "ib-agent-description": "Individual",
+    "ib-trading-mode": "paper",
+    "ib-enable-delayed-streaming-data": false,
+    "ib-weekly-restart-utc-time": "22:00:00",
+    "ib-host": "ibgateway",
+    "ib-port": "4002",
+
+    "//": "============================================================",
+    "//": "Live Trading Environment",
+    "//": "============================================================",
+    "environments": {
+        "live-interactive-brokers": {
+            "live-mode": true,
+            "live-mode-brokerage": "InteractiveBrokersBrokerage",
+            "setup-handler": "QuantConnect.Lean.Engine.Setup.BrokerageSetupHandler",
+            "result-handler": "QuantConnect.Lean.Engine.Results.LiveTradingResultHandler",
+            "data-feed-handler": "QuantConnect.Lean.Engine.DataFeeds.LiveTradingDataFeed",
+            "data-queue-handler": "QuantConnect.Brokerages.InteractiveBrokers.InteractiveBrokersBrokerage",
+            "real-time-handler": "QuantConnect.Lean.Engine.RealTime.LiveTradingRealTimeHandler",
+            "transaction-handler": "QuantConnect.Lean.Engine.TransactionHandlers.BrokerageTransactionHandler",
+            "history-provider": [
+                "BrokerageHistoryProvider",
+                "QuantConnect.Lean.Engine.HistoricalData.SubscriptionDataReaderHistoryProvider"
+            ]
+        }
+    },
+
+    "//": "============================================================",
+    "//": "Live Cash & Holdings (leave empty for auto-sync from IB)",
+    "//": "============================================================",
+    "live-cash-balance": "",
+    "live-holdings": "[]"
+}
