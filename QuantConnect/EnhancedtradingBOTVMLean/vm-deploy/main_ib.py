@@ -25,6 +25,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from bot_config import BOT_Config
+from live_feeds import FeedManager
 
 
 class TradingBot:
@@ -61,6 +62,28 @@ class TradingBot:
         self.entry_time: dict[str, datetime] = {}
         self.entry_price: dict[str, float] = {}
         self.highest_price: dict[str, float] = {}
+        self._entry_strategy_reason: dict[str, str] = {}
+
+        # Portfolio mix of intraday strategies from the deployment deck.
+        # market_making and sentiment are now live-feed-backed.
+        self._strategy_weights: dict[str, float] = {
+            "momentum": 0.30,
+            "mean_reversion": 0.20,
+            "orb": 0.15,
+            "vwap_twap": 0.20,
+            "market_making": 0.05,  # driven by order-book imbalance feed
+            "stat_arb": 0.00,
+            "sentiment": 0.10,      # driven by Alpaca news + VADER NLP feed
+        }
+
+        # ── Live feeds (Alpaca News + IEX quote stream) ───────────────────
+        feeds_cfg = self.config.feeds
+        self._feeds = FeedManager(
+            api_key=feeds_cfg.alpaca_api_key,
+            api_secret=feeds_cfg.alpaca_api_secret,
+            news_poll_interval_seconds=feeds_cfg.news_poll_interval_seconds,
+        )
+        self._min_portfolio_signal_score: float = 0.30
 
         self.trade_history: deque = deque(maxlen=50)
         self.winning_trades: deque = deque(maxlen=30)
@@ -324,6 +347,8 @@ class TradingBot:
         merged = list(self.config.universe.core_symbols) + sorted(self._dynamic_symbols)
         seen = set()
         self._active_universe = [t for t in merged if not (t in seen or seen.add(t))]
+        # Keep live feeds subscribed to the current universe.
+        self._feeds.update_symbols(self._active_universe)
 
     def _extract_revenue_growth_from_payload(self, payload) -> float | None:
         """Extract revenue growth from varied provider payload shapes."""
@@ -585,7 +610,7 @@ class TradingBot:
             return None
 
     def _compute_symbol_indicators(self, ticker: str) -> dict | None:
-        """Per-symbol hourly: MACD(12,26,9), RSI(14), EMA(50)."""
+        """Per-symbol hourly indicators used by strategy portfolio scoring."""
         try:
             contract = self._contracts.get(ticker)
             if not contract:
@@ -608,10 +633,35 @@ class TradingBot:
                 df = pd.concat([df, macd_df], axis=1)
             df["rsi"] = ta.rsi(df["close"], length=14)
             df["ema_50"] = ta.ema(df["close"], length=50)
+            df["atr_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+
+            vol = df["volume"].replace(0, pd.NA)
+            df["vwap"] = (df["close"] * vol).cumsum() / vol.cumsum()
+            df["bb_mid"] = df["close"].rolling(20).mean()
+            df["bb_std"] = df["close"].rolling(20).std(ddof=0)
+            df["zscore"] = (df["close"] - df["bb_mid"]) / df["bb_std"].replace(0, pd.NA)
+            df["vol_sma_20"] = df["volume"].rolling(20).mean()
 
             latest = df.iloc[-1]
             macd_col = "MACD_12_26_9"
             signal_col = "MACDs_12_26_9"
+
+            opening_range_high = float(latest["high"])
+            opening_range_low = float(latest["low"])
+            if "date" in df.columns:
+                dt_series = pd.to_datetime(df["date"])
+                current_day = dt_series.iloc[-1].date()
+                day_df = df[dt_series.dt.date == current_day].head(2)
+                if len(day_df) >= 1:
+                    opening_range_high = float(day_df["high"].max())
+                    opening_range_low = float(day_df["low"].min())
+
+            vol_sma = float(latest.get("vol_sma_20", 0) or 0)
+            volume_ratio = (float(latest["volume"]) / vol_sma) if vol_sma > 0 else 1.0
+
+            zscore_val = latest.get("zscore", 0)
+            if pd.isna(zscore_val):
+                zscore_val = 0.0
 
             return {
                 "price": float(latest["close"]),
@@ -619,10 +669,93 @@ class TradingBot:
                 "macd_signal": float(latest.get(signal_col, 0)),
                 "rsi": float(latest.get("rsi", 50)),
                 "ema_50": float(latest.get("ema_50", 0)),
+                "atr_14": float(latest.get("atr_14", 0)),
+                "vwap": float(latest.get("vwap", 0)),
+                "zscore": float(zscore_val),
+                "volume_ratio": volume_ratio,
+                "opening_range_high": opening_range_high,
+                "opening_range_low": opening_range_low,
             }
         except Exception as e:
             self.logger.error(f"{ticker} indicator error: {e}")
             return None
+
+    def _compute_portfolio_signal(self, ticker: str, ind: dict) -> tuple[float, str]:
+        """Blend enabled strategy components into one entry score."""
+        price = ind["price"]
+        macd = ind["macd"]
+        macd_sig = ind["macd_signal"]
+        rsi_val = ind["rsi"]
+        ema_val = ind["ema_50"]
+        vwap = ind["vwap"]
+        zscore = ind["zscore"]
+        volume_ratio = ind["volume_ratio"]
+        orb_high = ind["opening_range_high"]
+
+        # ── Live feed signals ──────────────────────────────────────────────
+        sentiment_raw = self._feeds.get_sentiment(ticker)        # [-1, 1]
+        ob_imbalance  = self._feeds.get_ob_imbalance(ticker)     # [-1, 1]
+
+        component_scores: dict[str, float] = {
+            "momentum": 0.0,
+            "mean_reversion": 0.0,
+            "orb": 0.0,
+            "vwap_twap": 0.0,
+            "market_making": 0.0,
+            "stat_arb": 0.0,
+            "sentiment": 0.0,
+        }
+
+        if price > ema_val and macd > macd_sig and 55 <= rsi_val <= 72:
+            raw = ((macd - macd_sig) * 100) + min(1.0, max(0.0, volume_ratio - 1.0))
+            component_scores["momentum"] = min(1.0, max(0.0, raw))
+
+        if zscore < -1.8 and rsi_val < 42 and price < vwap:
+            component_scores["mean_reversion"] = min(1.0, abs(zscore) / 3.0)
+
+        if price > orb_high and volume_ratio >= 1.2:
+            component_scores["orb"] = min(1.0, (price / max(orb_high, 1e-9)) - 1.0 + 0.5)
+
+        if price > vwap and macd > macd_sig:
+            component_scores["vwap_twap"] = min(1.0, ((price / max(vwap, 1e-9)) - 1.0) * 200)
+
+        # Sentiment component: positive news consensus required (> +0.10 threshold)
+        if sentiment_raw > 0.10:
+            component_scores["sentiment"] = min(1.0, (sentiment_raw - 0.10) / 0.90)
+
+        # Market-making / order-book component: bid-heavy quote stream required
+        if ob_imbalance > 0.10:
+            component_scores["market_making"] = min(1.0, (ob_imbalance - 0.10) / 0.90)
+
+        weighted = 0.0
+        active = []
+        for name, score in component_scores.items():
+            weight = self._strategy_weights.get(name, 0.0)
+            if score > 0 and weight > 0:
+                active.append(f"{name}:{score:.2f}")
+            weighted += weight * score
+
+        return weighted, ", ".join(active) if active else "none"
+
+    def flatten_intraday_positions(self):
+        """Flatten algorithm-managed positions before close for intraday risk control."""
+        if not self._is_market_open():
+            self._log_market_closed_skip("flatten_intraday_positions")
+            return
+
+        positions = self._get_positions()
+        for ticker in list(self._algo_managed_positions):
+            pos = positions.get(ticker)
+            if not pos:
+                continue
+            qty = int(pos.get("qty", 0))
+            if qty <= 0:
+                continue
+            sold = self._place_market_sell(ticker, qty, "eod_flatten")
+            if sold:
+                self._algo_managed_positions.discard(ticker)
+                self._entry_strategy_reason.pop(ticker, None)
+                self.logger.info(f"EOD FLATTEN: {ticker} qty={qty}")
 
     # ================================================================
     #  MARKET REGIME DETECTION
@@ -943,6 +1076,7 @@ class TradingBot:
                             self.losing_trades.append(trade_record)
                         self._update_symbol_performance(ticker, pnl_dollar)
                         self._algo_managed_positions.discard(ticker)
+                        self._entry_strategy_reason.pop(ticker, None)
                         self.logger.info(
                             f"EXIT {ticker}: {reason}, P&L ${pnl_dollar:.0f}"
                         )
@@ -999,18 +1133,13 @@ class TradingBot:
             if not indicators:
                 continue
 
-            macd_val = indicators["macd"]
-            macd_sig = indicators["macd_signal"]
-            rsi_val = indicators["rsi"]
-            ema_val = indicators["ema_50"]
             price = indicators["price"]
-
-            if price <= 0 or ema_val <= 0:
+            if price <= 0:
                 continue
 
-            if macd_val > macd_sig and 45 < rsi_val < 65 and price > ema_val:
-                score = (macd_val - macd_sig) * (rsi_val / 100)
-                candidates.append((ticker, score, price))
+            score, reason = self._compute_portfolio_signal(ticker, indicators)
+            if score >= self._min_portfolio_signal_score:
+                candidates.append((ticker, score, price, reason))
 
             # Rate-limit IB API requests (pacing)
             self.ib.sleep(0.5)
@@ -1020,7 +1149,7 @@ class TradingBot:
             return
 
         candidates.sort(key=lambda x: x[1], reverse=True)
-        best_ticker, _, current_price = candidates[0]
+        best_ticker, best_score, current_price, reason = candidates[0]
 
         # Re-fetch live price
         live_price = self._get_price(best_ticker)
@@ -1037,13 +1166,16 @@ class TradingBot:
             self.entry_time[best_ticker] = now
             self.entry_price[best_ticker] = current_price
             self.highest_price[best_ticker] = current_price
+            self._entry_strategy_reason[best_ticker] = reason
 
             trade_record = (
                 f"{now.strftime('%Y-%m-%d %H:%M')} BUY {best_ticker} "
-                f"- Qty: {qty} @ ${current_price:.2f}"
+                f"- Qty: {qty} @ ${current_price:.2f} | score={best_score:.2f} | {reason}"
             )
             self.trade_history.append(trade_record)
-            self.logger.info(f"BUY {best_ticker}: qty={qty}, ${current_price:.2f}")
+            self.logger.info(
+                f"BUY {best_ticker}: qty={qty}, ${current_price:.2f}, score={best_score:.2f}, {reason}"
+            )
 
     def _update_symbol_performance(self, ticker: str, pnl: float):
         perf = self.symbol_performance[ticker]
@@ -1271,6 +1403,7 @@ class TradingBot:
             (9,  30, self.evaluate_signals,             "signals_morning"),
             (12, 30, self.evaluate_signals,             "signals_midday"),
             (15, 30, self.evaluate_signals,             "signals_afternoon"),
+            (15, 55, self.flatten_intraday_positions,   "flatten_eod"),
             # Portfolio emails
             (9,  35, self.send_portfolio_summary_email, "email_morning"),
             (12, 30, self.send_portfolio_summary_email, "email_midday"),
@@ -1332,6 +1465,9 @@ class TradingBot:
         self._refresh_dynamic_universe(force=True)
         self._subscribe_market_data()
 
+        # Start live feeds (non-blocking daemon threads)
+        self._feeds.start()
+
         # Run initial regime detection
         self.detect_market_regime()
 
@@ -1371,6 +1507,10 @@ class TradingBot:
         """Graceful shutdown."""
         self.logger.info("Shutting down...")
         self._running = False
+        try:
+            self._feeds.stop()
+        except Exception:
+            pass
         try:
             self.scheduler.shutdown(wait=False)
         except Exception:

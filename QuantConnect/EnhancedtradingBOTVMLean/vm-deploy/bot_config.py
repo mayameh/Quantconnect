@@ -143,3 +143,22 @@ class BOT_Config:
         sender_email = os.environ.get("BOT_EMAIL_USER", "mehrotram@gmail.com")
         sender_password = os.environ.get("BOT_EMAIL_PASS", "")
         recipient_email = os.environ.get("BOT_EMAIL_TO", "mayank@mehrotra.co.in")
+
+    # ============================================================
+    # LIVE FEEDS  (free-tier Alpaca + VADER sentiment)
+    # ============================================================
+    class feeds:
+        # Re-uses the same Alpaca credentials as the fundamentals fetch above.
+        # Set BOT_ALPACA_API_KEY and BOT_ALPACA_API_SECRET in the environment.
+        alpaca_api_key    = os.environ.get("BOT_ALPACA_API_KEY", "")
+        alpaca_api_secret = os.environ.get("BOT_ALPACA_API_SECRET", "")
+
+        # How often the news poller hits the Alpaca /v1beta1/news REST endpoint.
+        # Free tier supports comfortable polling at 5 minutes.
+        news_poll_interval_seconds: int = 300
+
+        # Order-book imbalance: stale quotes older than this are ignored.
+        ob_max_age_seconds: int = 60
+
+        # Sentiment: headlines older than this (minutes) receive zero weight.
+        sentiment_max_age_minutes: int = 120

@@ -50,6 +50,18 @@ class MainIBBacktestHarness:
         self.entry_time = {}
         self.entry_price = {}
         self.highest_price = {}
+        self._entry_strategy_reason = {}
+
+        self._strategy_weights = {
+            "momentum": 0.35,
+            "mean_reversion": 0.25,
+            "orb": 0.20,
+            "vwap_twap": 0.20,
+            "market_making": 0.00,
+            "stat_arb": 0.00,
+            "sentiment": 0.00,
+        }
+        self._min_portfolio_signal_score = 0.30
 
         self.trade_history = deque(maxlen=200)
         self.winning_trades = deque(maxlen=100)
@@ -397,6 +409,20 @@ class MainIBBacktestHarness:
 
         latest = sl.iloc[-1]
 
+        bb_mid = sl["close"].rolling(20).mean().iloc[-1]
+        bb_std = sl["close"].rolling(20).std(ddof=0).iloc[-1]
+        zscore = 0.0 if pd.isna(bb_mid) or pd.isna(bb_std) or bb_std == 0 else float((latest["close"] - bb_mid) / bb_std)
+
+        vol_sma = sl["volume"].rolling(20).mean().iloc[-1]
+        volume_ratio = 1.0 if pd.isna(vol_sma) or vol_sma <= 0 else float(latest["volume"] / vol_sma)
+
+        vwap_num = (sl["close"] * sl["volume"]).rolling(20).sum().iloc[-1]
+        vwap_den = sl["volume"].rolling(20).sum().iloc[-1]
+        vwap = float(latest["close"]) if pd.isna(vwap_den) or vwap_den <= 0 else float(vwap_num / vwap_den)
+
+        orb_high = float(sl["high"].tail(20).max())
+        orb_low = float(sl["low"].tail(20).min())
+
         vals = {
             "price": latest.get("close"),
             "macd": latest.get("macd"),
@@ -408,7 +434,61 @@ class MainIBBacktestHarness:
         if any(pd.isna(v) for v in vals.values()):
             return None
 
-        return {k: float(v) for k, v in vals.items()}
+        out = {k: float(v) for k, v in vals.items()}
+        out.update(
+            {
+                "vwap": vwap,
+                "zscore": zscore,
+                "volume_ratio": volume_ratio,
+                "opening_range_high": orb_high,
+                "opening_range_low": orb_low,
+            }
+        )
+        return out
+
+    def _compute_portfolio_signal(self, ticker, ind):
+        price = ind["price"]
+        macd = ind["macd"]
+        macd_sig = ind["macd_signal"]
+        rsi_val = ind["rsi"]
+        ema_val = ind["ema_50"]
+        vwap = ind["vwap"]
+        zscore = ind["zscore"]
+        volume_ratio = ind["volume_ratio"]
+        orb_high = ind["opening_range_high"]
+
+        component_scores = {
+            "momentum": 0.0,
+            "mean_reversion": 0.0,
+            "orb": 0.0,
+            "vwap_twap": 0.0,
+            "market_making": 0.0,
+            "stat_arb": 0.0,
+            "sentiment": 0.0,
+        }
+
+        if price > ema_val and macd > macd_sig and 55 <= rsi_val <= 72:
+            raw = ((macd - macd_sig) * 100) + min(1.0, max(0.0, volume_ratio - 1.0))
+            component_scores["momentum"] = min(1.0, max(0.0, raw))
+
+        if zscore < -1.8 and rsi_val < 42 and price < vwap:
+            component_scores["mean_reversion"] = min(1.0, abs(zscore) / 3.0)
+
+        if price > orb_high and volume_ratio >= 1.2:
+            component_scores["orb"] = min(1.0, (price / max(orb_high, 1e-9)) - 1.0 + 0.5)
+
+        if price > vwap and macd > macd_sig:
+            component_scores["vwap_twap"] = min(1.0, ((price / max(vwap, 1e-9)) - 1.0) * 200)
+
+        weighted = 0.0
+        active = []
+        for name, score in component_scores.items():
+            weight = self._strategy_weights.get(name, 0.0)
+            if score > 0 and weight > 0:
+                active.append(f"{name}:{score:.2f}")
+            weighted += weight * score
+
+        return weighted, ", ".join(active) if active else "none"
 
     def detect_market_regime(self, date_value):
         spy = self._compute_spy_indicators(date_value)
@@ -589,6 +669,7 @@ class MainIBBacktestHarness:
 
             if should_exit and self._place_market_sell(ticker, qty, reason):
                 self._algo_managed_positions.discard(ticker)
+                self._entry_strategy_reason.pop(ticker, None)
                 self._record_trade(date_value, ticker, "SELL", qty, current_price, pnl_pct * 100, reason)
 
                 msg = (
@@ -635,24 +716,19 @@ class MainIBBacktestHarness:
             if not indicators:
                 continue
 
-            macd_val = indicators["macd"]
-            macd_sig = indicators["macd_signal"]
-            rsi_val = indicators["rsi"]
-            ema_val = indicators["ema_50"]
             price = indicators["price"]
-
-            if price <= 0 or ema_val <= 0:
+            if price <= 0:
                 continue
 
-            if macd_val > macd_sig and 45 < rsi_val < 65 and price > ema_val:
-                score = (macd_val - macd_sig) * (rsi_val / 100)
-                candidates.append((ticker, score, price))
+            score, reason = self._compute_portfolio_signal(ticker, indicators)
+            if score >= self._min_portfolio_signal_score:
+                candidates.append((ticker, score, price, reason))
 
         if not candidates:
             return
 
         candidates.sort(key=lambda x: x[1], reverse=True)
-        best_ticker, _, current_price = candidates[0]
+        best_ticker, best_score, current_price, reason = candidates[0]
 
         live_price = self._get_price(best_ticker)
         if live_price > 0:
@@ -667,10 +743,12 @@ class MainIBBacktestHarness:
             self.entry_time[best_ticker] = now
             self.entry_price[best_ticker] = current_price
             self.highest_price[best_ticker] = current_price
+            self._entry_strategy_reason[best_ticker] = reason
 
-            self._record_trade(date_value, best_ticker, "BUY", qty, current_price, 0.0, "macd_rsi_ema")
+            self._record_trade(date_value, best_ticker, "BUY", qty, current_price, 0.0, reason)
             self.trade_history.append(
-                f"{now.strftime('%Y-%m-%d')} BUY {best_ticker} - Qty: {qty} @ ${current_price:.2f}"
+                f"{now.strftime('%Y-%m-%d')} BUY {best_ticker} - Qty: {qty} @ ${current_price:.2f} "
+                f"| score={best_score:.2f} | {reason}"
             )
 
     # ---------------------------------------------------------------------
@@ -751,7 +829,11 @@ class MainIBBacktestHarness:
         if not trades_df.empty:
             print("\nRecent Trades (last 12):")
             for _, row in trades_df.tail(12).iterrows():
-                reason = row.get("entry_reason", row.get("exit_reason", ""))
+                reason = row.get("entry_reason", "")
+                if pd.isna(reason) or reason == "":
+                    reason = row.get("exit_reason", "")
+                if pd.isna(reason):
+                    reason = ""
                 pnl_txt = f" {row['pnl_pct']:+.2f}%" if row["action"] == "SELL" else ""
                 print(
                     f"  {row['date']} {row['action']:4s} {int(row['qty']):4d}x {row['symbol']:6s} "

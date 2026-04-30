@@ -14,3 +14,7 @@ tzdata>=2024.1
 
 # Optional: for enhanced logging / monitoring
 python-dotenv>=1.0
+
+# Live feeds (free tier)
+vaderSentiment>=3.3.2     # NLP sentiment for news headlines
+websocket-client>=1.6.0   # Alpaca IEX quote WebSocket stream
