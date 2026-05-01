@@ -13,7 +13,8 @@ class BOT_Config:
     # ============================================================
     class general:
         strategy_name = "AI-Enhanced Hybrid Universe Strategy"
-        mode = "PAPER"              # "PAPER" or "LIVE"
+        mode = "LIVE"              # "PAPER" or "LIVE"
+        trading_style = os.environ.get("BOT_TRADING_STYLE", "SWING").strip().upper()
         starting_capital = 11000
 
     # ============================================================
@@ -33,6 +34,9 @@ class BOT_Config:
     class risk:
         max_daily_loss        = 100     # $100 daily loss → circuit breaker
         max_drawdown_pct      = 0.05    # 5 % max drawdown
+
+        intraday_max_daily_loss = 150
+        swing_max_daily_loss    = 250
 
         max_position_size_pct = 0.25
         min_entry_notional    = 4000
@@ -60,6 +64,24 @@ class BOT_Config:
         max_weekly_trades         = 2
         min_days_between_trades   = 3
         symbol_cooldown_days      = 10
+
+        intraday_signal_interval_minutes = 15
+        intraday_orb_minutes             = 30
+        intraday_stop_loss_pct           = 0.01
+        intraday_take_profit_pct         = 0.025
+        intraday_profit_lock_hours       = 3
+        intraday_profit_lock_min_gain_pct = 0.006
+        intraday_trailing_stop_pct       = 0.008
+        intraday_trailing_activation_pct = 0.012
+        intraday_flatten_positions       = True
+
+        swing_stop_loss_pct              = 0.03
+        swing_take_profit_pct            = 0.08
+        swing_profit_lock_hours          = 30
+        swing_profit_lock_min_gain_pct   = 0.018
+        swing_trailing_stop_pct          = 0.03
+        swing_trailing_activation_pct    = 0.04
+        swing_flatten_positions          = False
 
     # ============================================================
     # UNIVERSE

@@ -34,13 +34,17 @@ class AlpacaBacktestHarness:
     """
 
     def __init__(self, symbols: list[str], start_date: str, end_date: str,
-                 starting_cash: float = 11_000.0):
+                 starting_cash: float = 11_000.0, trading_style: str = "INTRADAY"):
         self.config   = BOT_Config()
         self.et       = pytz.timezone("US/Eastern")
 
         self.start_date = pd.to_datetime(start_date).tz_localize(self.et)
         self.end_date   = pd.to_datetime(end_date).tz_localize(self.et)
         self.starting_cash = float(starting_cash)
+        self.trading_style = str(trading_style or "INTRADAY").strip().upper()
+        if self.trading_style not in {"INTRADAY", "SWING"}:
+            self.trading_style = "INTRADAY"
+        self._style_settings = self._build_style_settings()
 
         # Mock clients (replace real Alpaca SDK)
         self.trading_client = MockTradingClient(self.starting_cash)
@@ -64,6 +68,8 @@ class AlpacaBacktestHarness:
         self.entry_price:              dict[str, float]    = {}
         self.highest_price:            dict[str, float]    = {}
         self._entry_strategy_reason:   dict[str, str]      = {}
+        self._entry_timestamps:        deque               = deque(maxlen=200)
+        self._last_exit_time:          dict[str, datetime] = {}
 
         self._strategy_weights: dict[str, float] = {
             "momentum":       0.30,
@@ -88,6 +94,48 @@ class AlpacaBacktestHarness:
         self.trades:        list[dict] = []
         self.equity_history: list[dict] = []
         self.loaded_symbols: set[str]  = set()
+
+    def _build_style_settings(self) -> dict:
+        cfg = self.config.trading
+        risk = self.config.risk
+        if self.trading_style == "SWING":
+            return {
+                "flatten_eod": False,
+                "stop_loss_pct": float(getattr(cfg, "swing_stop_loss_pct", cfg.stop_loss_pct)),
+                "take_profit_pct": float(getattr(cfg, "swing_take_profit_pct", cfg.take_profit_pct)),
+                "profit_lock_hours": int(getattr(cfg, "swing_profit_lock_hours", cfg.profit_lock_hours)),
+                "profit_lock_min_gain_pct": float(
+                    getattr(cfg, "swing_profit_lock_min_gain_pct", cfg.profit_lock_min_gain_pct)
+                ),
+                "trailing_stop_pct": float(getattr(cfg, "swing_trailing_stop_pct", cfg.trailing_stop_pct)),
+                "trailing_activation_pct": float(
+                    getattr(cfg, "swing_trailing_activation_pct", cfg.trailing_activation_pct)
+                ),
+                "max_daily_loss": max(
+                    float(getattr(risk, "max_daily_loss", 100)),
+                    float(getattr(risk, "swing_max_daily_loss", 250)),
+                ),
+                "min_hold_hours": int(getattr(cfg, "min_hold_hours", 24)),
+                "max_hold_days": int(getattr(cfg, "max_hold_days", 14)),
+            }
+        return {
+            "flatten_eod": True,
+            "stop_loss_pct": float(getattr(cfg, "intraday_stop_loss_pct", 0.01)),
+            "take_profit_pct": float(getattr(cfg, "intraday_take_profit_pct", 0.025)),
+            "profit_lock_hours": int(getattr(cfg, "intraday_profit_lock_hours", 3)),
+            "profit_lock_min_gain_pct": float(getattr(cfg, "intraday_profit_lock_min_gain_pct", 0.006)),
+            "trailing_stop_pct": float(getattr(cfg, "intraday_trailing_stop_pct", 0.008)),
+            "trailing_activation_pct": float(getattr(cfg, "intraday_trailing_activation_pct", 0.012)),
+            "max_daily_loss": max(
+                float(getattr(risk, "max_daily_loss", 100)),
+                float(getattr(risk, "intraday_max_daily_loss", 150)),
+            ),
+            "min_hold_hours": 0,
+            "max_hold_days": 1,
+        }
+
+    def _is_swing_style(self) -> bool:
+        return self.trading_style == "SWING"
 
     # =========================================================================
     #  DATA LOADING
@@ -201,6 +249,14 @@ class AlpacaBacktestHarness:
             "low":    float(row["low"]),   "close": float(row["close"]),
             "volume": int(row["volume"]),
         }
+
+    def _get_entry_price(self, symbol: str, current_ts) -> float:
+        bar = self._get_bar(symbol, current_ts)
+        if not bar:
+            return 0.0
+        if self._style_settings["flatten_eod"]:
+            return float(bar["open"])
+        return float(bar["close"])
 
     def _advance_prices(self, ts):
         for symbol in self.loaded_symbols:
@@ -346,8 +402,10 @@ class AlpacaBacktestHarness:
             "rsi":         v(latest, "rsi"),
         }
 
-    def _compute_symbol_indicators(self, ticker: str, current_ts) -> dict | None:
+    def _compute_intraday_indicators(self, ticker: str, current_ts) -> dict | None:
         sl = self._get_bar_slice(ticker, current_ts)
+        if self._style_settings["flatten_eod"] and len(sl) > 1:
+            sl = sl.iloc[:-1]
         if sl.empty or len(sl) < 52:
             return None
 
@@ -381,6 +439,55 @@ class AlpacaBacktestHarness:
                     "opening_range_high": orb_high, "opening_range_low": orb_high,
                     "atr_14": 0.0})
         return out
+
+    def _compute_swing_indicators(self, ticker: str, current_ts) -> dict | None:
+        sl = self._get_bar_slice(ticker, current_ts)
+        if sl.empty or len(sl) < 55:
+            return None
+
+        latest = sl.iloc[-1]
+        bb_mid = sl["close"].rolling(20).mean().iloc[-1]
+        bb_std = sl["close"].rolling(20).std(ddof=0).iloc[-1]
+        zscore = (0.0 if pd.isna(bb_mid) or pd.isna(bb_std) or bb_std == 0
+                  else float((latest["close"] - bb_mid) / bb_std))
+        vol_sma = sl["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = 1.0 if pd.isna(vol_sma) or vol_sma <= 0 else float(latest["volume"] / vol_sma)
+        vwap_n = (sl["close"] * sl["volume"]).rolling(20).sum().iloc[-1]
+        vwap_d = sl["volume"].rolling(20).sum().iloc[-1]
+        vwap = (float(latest["close"]) if pd.isna(vwap_d) or vwap_d <= 0
+                else float(vwap_n / vwap_d))
+        breakout_20 = sl["high"].rolling(20).max().iloc[-1]
+
+        needed = {"close": "price", "macd": "macd", "macd_signal": "macd_signal",
+                  "rsi": "rsi", "ema_50": "ema_50"}
+        out = {}
+        for col, key in needed.items():
+            val = latest.get(col)
+            if val is None or pd.isna(val):
+                return None
+            out[key] = float(val)
+
+        out.update({"vwap": vwap, "zscore": zscore, "volume_ratio": vol_ratio,
+                    "opening_range_high": float(breakout_20), "opening_range_low": float(latest["low"]),
+                    "atr_14": 0.0})
+        return out
+
+    def _compute_symbol_indicators(self, ticker: str, current_ts) -> dict | None:
+        if self._is_swing_style():
+            return self._compute_swing_indicators(ticker, current_ts)
+        return self._compute_intraday_indicators(ticker, current_ts)
+
+    def _trade_count_this_week(self, now: datetime) -> int:
+        week_start = (now - timedelta(days=now.weekday())).date()
+        return sum(1 for ts in self._entry_timestamps if ts.date() >= week_start)
+
+    def _symbol_on_cooldown(self, ticker: str, now: datetime) -> bool:
+        cfg = self.config.trading
+        last_exit = self._last_exit_time.get(ticker)
+        if not last_exit:
+            return False
+        elapsed_days = (now.date() - last_exit.date()).days
+        return elapsed_days < int(getattr(cfg, "min_days_between_trades", 0)) or elapsed_days < int(getattr(cfg, "symbol_cooldown_days", 0))
 
     def _compute_portfolio_signal(self, ticker: str, ind: dict) -> tuple[float, str]:
         price        = ind["price"]
@@ -475,15 +582,19 @@ class AlpacaBacktestHarness:
             total_cost = qty * price + self._estimate_fee(qty, price)
         return qty if qty > 0 and total_cost >= 4000 else 0
 
-    def _place_market_buy(self, ticker: str, qty: int) -> bool:
+    def _place_market_buy(self, ticker: str, qty: int, fill_price: float | None = None) -> bool:
         from mock_alpaca import _OrderStatus
+        if fill_price is not None and fill_price > 0:
+            self.trading_client.update_price(ticker, fill_price)
         req   = type("R", (), {"symbol": ticker, "qty": qty, "side": "buy",
                                "time_in_force": "day"})()
         order = self.trading_client.submit_order(req)
         return order.status == _OrderStatus.FILLED
 
-    def _place_market_sell(self, ticker: str, qty: int, reason: str = "") -> bool:
+    def _place_market_sell(self, ticker: str, qty: int, reason: str = "", fill_price: float | None = None) -> bool:
         from mock_alpaca import _OrderStatus
+        if fill_price is not None and fill_price > 0:
+            self.trading_client.update_price(ticker, fill_price)
         req   = type("R", (), {"symbol": ticker, "qty": qty, "side": "sell",
                                "time_in_force": "day"})()
         order = self.trading_client.submit_order(req)
@@ -522,7 +633,7 @@ class AlpacaBacktestHarness:
             return
 
         daily_loss = self._starting_cash - current_equity
-        if daily_loss > self.config.risk.max_daily_loss:
+        if daily_loss > self._style_settings["max_daily_loss"]:
             self._trading_enabled = False
             return
 
@@ -556,23 +667,29 @@ class AlpacaBacktestHarness:
             )
 
             should_exit, reason = False, ""
-            cfg = self.config.trading
+            cfg = self._style_settings
 
-            if pnl_pct <= -cfg.stop_loss_pct:
+            if pnl_pct <= -cfg["stop_loss_pct"]:
                 should_exit, reason = True, "stop_loss"
-            elif pnl_pct >= cfg.take_profit_pct:
+            elif held >= timedelta(hours=cfg["min_hold_hours"]) and pnl_pct >= cfg["take_profit_pct"]:
                 should_exit, reason = True, "take_profit"
-            elif held >= timedelta(hours=cfg.profit_lock_hours) and pnl_pct >= cfg.profit_lock_min_gain_pct:
+            elif held >= timedelta(hours=cfg["profit_lock_hours"]) and pnl_pct >= cfg["profit_lock_min_gain_pct"]:
                 should_exit, reason = True, "profit_lock"
-            elif held >= timedelta(days=cfg.max_hold_days):
+            elif held >= timedelta(days=cfg["max_hold_days"]):
                 should_exit, reason = True, "time_exit"
+
+            trail_activation = avg_entry * (1 + cfg["trailing_activation_pct"])
+            trailing_stop = self.highest_price.get(ticker, current_price) * (1 - cfg["trailing_stop_pct"])
+            if self.highest_price.get(ticker, current_price) >= trail_activation and current_price <= trailing_stop:
+                should_exit, reason = True, "trailing_stop"
 
             if pnl_pct <= -0.05:
                 should_exit, reason = True, "gap_protection"
 
-            if should_exit and self._place_market_sell(ticker, qty, reason):
+            if should_exit and self._place_market_sell(ticker, qty, reason, current_price):
                 self._algo_managed_positions.discard(ticker)
                 self._entry_strategy_reason.pop(ticker, None)
+                self._last_exit_time[ticker] = now
                 self._update_symbol_performance(ticker, pnl_dollar)
                 self._record_trade(now, ticker, "SELL", qty, current_price, pnl_pct * 100, reason)
 
@@ -603,9 +720,14 @@ class AlpacaBacktestHarness:
         if algo_count >= max_allowed or self.cash < 4000:
             return
 
+        if self._is_swing_style() and self._trade_count_this_week(now) >= self.config.trading.max_weekly_trades:
+            return
+
         candidates: list[tuple] = []
         for ticker in self._active_universe:
             if ticker == "SPY" or ticker in positions:
+                continue
+            if self._is_swing_style() and self._symbol_on_cooldown(ticker, now):
                 continue
             ind = self._compute_symbol_indicators(ticker, current_ts)
             if not ind or ind["price"] <= 0:
@@ -620,26 +742,53 @@ class AlpacaBacktestHarness:
         candidates.sort(key=lambda x: x[1], reverse=True)
         best_ticker, best_score, current_price, reason = candidates[0]
 
-        live_price = self._get_price(best_ticker)
-        if live_price > 0:
-            current_price = live_price
+        entry_price = self._get_entry_price(best_ticker, current_ts)
+        if entry_price > 0:
+            current_price = entry_price
+        else:
+            live_price = self._get_price(best_ticker)
+            if live_price > 0:
+                current_price = live_price
 
         qty = self._calculate_position_size(current_price)
         if qty <= 0:
             return
 
-        if self._place_market_buy(best_ticker, qty):
+        if self._place_market_buy(best_ticker, qty, current_price):
             self._algo_managed_positions.add(best_ticker)
             self.entry_time[best_ticker]             = now
             self.entry_price[best_ticker]            = current_price
             self.highest_price[best_ticker]          = current_price
             self._entry_strategy_reason[best_ticker] = reason
+            self._entry_timestamps.append(now)
 
             self._record_trade(now, best_ticker, "BUY", qty, current_price, 0.0, reason)
             self.trade_history.append(
                 f"{now.strftime('%Y-%m-%d')} BUY {best_ticker} - Qty: {qty} "
                 f"@ ${current_price:.2f} | score={best_score:.2f} | {reason}"
             )
+
+    def flatten_intraday_positions(self, current_ts):
+        if not self._style_settings["flatten_eod"]:
+            return
+        now = current_ts.to_pydatetime()
+        positions = self._get_positions()
+        for ticker in list(self._algo_managed_positions):
+            pos = positions.get(ticker)
+            if not pos:
+                continue
+            qty = int(pos.get("qty", 0))
+            if qty <= 0:
+                continue
+            day_bar = self._get_bar(ticker, current_ts)
+            current_price = float(day_bar["close"]) if day_bar else pos.get("market_price", 0.0)
+            if self._place_market_sell(ticker, qty, "eod_flatten", current_price):
+                self._algo_managed_positions.discard(ticker)
+                self._entry_strategy_reason.pop(ticker, None)
+                self._last_exit_time[ticker] = now
+                avg_entry = float(pos.get("avg_cost", current_price) or current_price)
+                pnl_pct = ((current_price - avg_entry) / avg_entry * 100) if avg_entry > 0 else 0.0
+                self._record_trade(now, ticker, "SELL", qty, current_price, pnl_pct, "eod_flatten")
 
     # =========================================================================
     #  EQUITY UPDATE
@@ -663,6 +812,7 @@ class AlpacaBacktestHarness:
         self._refresh_dynamic_universe(ts, force=False)
         self.detect_market_regime(ts)
         self.evaluate_signals(ts)
+        self.flatten_intraday_positions(ts)
         self.update_equity(ts)
 
     def run_backtest(self):
@@ -671,6 +821,7 @@ class AlpacaBacktestHarness:
         print("=" * 80)
         print(f"Period:  {self.start_date.date()} → {self.end_date.date()}")
         print(f"Capital: ${self.starting_cash:,.2f}")
+        print(f"Style:   {self.trading_style}")
 
         self.load_all_data()
 
@@ -720,6 +871,7 @@ class AlpacaBacktestHarness:
         print("\n" + "=" * 70)
         print("BACKTEST REPORT — Alpaca Bot")
         print("=" * 70)
+        print(f"Style:       {self.trading_style}")
         print(f"\nCAPITAL:")
         print(f"  Starting:    ${self.starting_cash:,.2f}")
         print(f"  Ending:      ${end_eq:,.2f}")
@@ -786,16 +938,20 @@ if __name__ == "__main__":
     parser.add_argument("--start",   default="2024-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end",     default="2024-12-31", help="End date YYYY-MM-DD")
     parser.add_argument("--capital", type=float, default=11_000, help="Starting capital")
+    parser.add_argument("--style",   default="all", choices=["all", "intraday", "swing"], help="Trading style to backtest")
     args = parser.parse_args()
 
     cfg     = BOT_Config()
     symbols = cfg.universe.core_symbols
 
-    harness = AlpacaBacktestHarness(
-        symbols       = symbols,
-        start_date    = args.start,
-        end_date      = args.end,
-        starting_cash = args.capital,
-    )
-    harness.run_backtest()
-    harness.report()
+    styles = ["INTRADAY", "SWING"] if args.style == "all" else [args.style.upper()]
+    for style in styles:
+        harness = AlpacaBacktestHarness(
+            symbols       = symbols,
+            start_date    = args.start,
+            end_date      = args.end,
+            starting_cash = args.capital,
+            trading_style = style,
+        )
+        harness.run_backtest()
+        harness.report()

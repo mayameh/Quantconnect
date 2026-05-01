@@ -66,6 +66,12 @@ class AlpacaTradingBot:
         self._starting_cash: float = self.config.general.starting_capital
         self.peak_equity: float = self._starting_cash
         self.market_regime: str = "NEUTRAL"
+        self.trading_style: str = str(
+            getattr(self.config.general, "trading_style", "INTRADAY")
+        ).strip().upper()
+        if self.trading_style not in {"INTRADAY", "SWING"}:
+            self.trading_style = "INTRADAY"
+        self._style_settings = self._build_style_settings()
 
         self._dynamic_symbols: set[str] = set()
         self._active_universe: list[str] = list(self.config.universe.core_symbols)
@@ -77,6 +83,9 @@ class AlpacaTradingBot:
         self.entry_price: dict[str, float] = {}
         self.highest_price: dict[str, float] = {}
         self._entry_strategy_reason: dict[str, str] = {}
+        self._entry_timestamps: deque = deque(maxlen=200)
+        self._last_entry_time: dict[str, datetime] = {}
+        self._last_exit_time: dict[str, datetime] = {}
 
         self._strategy_weights: dict[str, float] = {
             "momentum":       0.30,
@@ -112,6 +121,54 @@ class AlpacaTradingBot:
 
         self._trading_enabled: bool = True
         self._running: bool = True
+
+    def _build_style_settings(self) -> dict:
+        cfg = self.config.trading
+        risk = self.config.risk
+        if self.trading_style == "SWING":
+            return {
+                "signal_source": "daily",
+                "flatten_eod": bool(getattr(cfg, "swing_flatten_positions", False)),
+                "stop_loss_pct": float(getattr(cfg, "swing_stop_loss_pct", cfg.stop_loss_pct)),
+                "take_profit_pct": float(getattr(cfg, "swing_take_profit_pct", cfg.take_profit_pct)),
+                "profit_lock_hours": int(getattr(cfg, "swing_profit_lock_hours", cfg.profit_lock_hours)),
+                "profit_lock_min_gain_pct": float(
+                    getattr(cfg, "swing_profit_lock_min_gain_pct", cfg.profit_lock_min_gain_pct)
+                ),
+                "trailing_stop_pct": float(getattr(cfg, "swing_trailing_stop_pct", cfg.trailing_stop_pct)),
+                "trailing_activation_pct": float(
+                    getattr(cfg, "swing_trailing_activation_pct", cfg.trailing_activation_pct)
+                ),
+                "max_daily_loss": max(
+                    float(getattr(risk, "max_daily_loss", 100)),
+                    float(getattr(risk, "swing_max_daily_loss", 250)),
+                ),
+                "min_hold_hours": int(getattr(cfg, "min_hold_hours", 24)),
+                "max_hold_days": int(getattr(cfg, "max_hold_days", 14)),
+            }
+
+        return {
+            "signal_source": "intraday",
+            "flatten_eod": bool(getattr(cfg, "intraday_flatten_positions", True)),
+            "stop_loss_pct": float(getattr(cfg, "intraday_stop_loss_pct", 0.01)),
+            "take_profit_pct": float(getattr(cfg, "intraday_take_profit_pct", 0.025)),
+            "profit_lock_hours": int(getattr(cfg, "intraday_profit_lock_hours", 3)),
+            "profit_lock_min_gain_pct": float(getattr(cfg, "intraday_profit_lock_min_gain_pct", 0.006)),
+            "trailing_stop_pct": float(getattr(cfg, "intraday_trailing_stop_pct", 0.008)),
+            "trailing_activation_pct": float(getattr(cfg, "intraday_trailing_activation_pct", 0.012)),
+            "max_daily_loss": max(
+                float(getattr(risk, "max_daily_loss", 100)),
+                float(getattr(risk, "intraday_max_daily_loss", 150)),
+            ),
+            "min_hold_hours": 0,
+            "max_hold_days": 1,
+        }
+
+    def _is_intraday_style(self) -> bool:
+        return self.trading_style == "INTRADAY"
+
+    def _is_swing_style(self) -> bool:
+        return self.trading_style == "SWING"
 
     # ================================================================
     #  LOGGING
@@ -260,6 +317,44 @@ class AlpacaTradingBot:
         except Exception as exc:
             self.logger.debug(f"_get_hourly_bars_df {ticker}: {exc}")
             return pd.DataFrame()
+
+    def _get_minute_bars_df(self, ticker: str, days: int = 2) -> pd.DataFrame:
+        """Fetch minute bars for session VWAP and opening-range calculations."""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=[ticker],
+                timeframe=TimeFrame.Minute,
+                start=datetime.now() - timedelta(days=days),
+                end=datetime.now(),
+            )
+            bar_set = self.data_client.get_stock_bars(req)
+            df = bar_set.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(ticker, level="symbol") if ticker in df.index.get_level_values("symbol") else pd.DataFrame()
+            df = df.copy()
+            df.columns = [str(c).lower() for c in df.columns]
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("US/Eastern")
+            return df
+        except Exception as exc:
+            self.logger.debug(f"_get_minute_bars_df {ticker}: {exc}")
+            return pd.DataFrame()
+
+    def _latest_session_slice(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or not hasattr(df.index, "date"):
+            return pd.DataFrame()
+        session_date = df.index[-1].date()
+        return df[df.index.map(lambda x: x.date() == session_date)].copy()
+
+    def _compute_session_vwap(self, df: pd.DataFrame) -> float:
+        session = self._latest_session_slice(df)
+        if session.empty:
+            return 0.0
+        vol = session["volume"].replace(0, pd.NA)
+        session_vwap = ((session["close"] * vol).cumsum() / vol.cumsum()).iloc[-1]
+        if pd.isna(session_vwap):
+            return float(session["close"].iloc[-1])
+        return float(session_vwap)
 
     def _extract_revenue_growth_from_payload(self, payload) -> float | None:
         if payload is None:
@@ -473,70 +568,148 @@ class AlpacaTradingBot:
             self.logger.error(f"SPY indicator error: {exc}")
             return None
 
+    def _compute_intraday_indicators(self, ticker: str) -> dict | None:
+        hourly_df = self._get_hourly_bars_df(ticker, days=12)
+        if hourly_df.empty or len(hourly_df) < 52:
+            self.logger.debug(f"{ticker}: insufficient hourly bars ({len(hourly_df)})")
+            return None
+
+        ema_fast = self._ema(hourly_df["close"], 12)
+        ema_slow = self._ema(hourly_df["close"], 26)
+        hourly_df["macd"] = ema_fast - ema_slow
+        hourly_df["macd_signal"] = self._ema(hourly_df["macd"], 9)
+        hourly_df["rsi"] = self._rsi(hourly_df["close"], 14)
+        hourly_df["ema_50"] = self._ema(hourly_df["close"], 50)
+
+        h, l, c = hourly_df["high"], hourly_df["low"], hourly_df["close"]
+        tr = pd.concat([
+            h - l,
+            (h - c.shift()).abs(),
+            (l - c.shift()).abs(),
+        ], axis=1).max(axis=1)
+        hourly_df["atr_14"] = tr.ewm(span=14, adjust=False).mean()
+        hourly_df["bb_mid"] = hourly_df["close"].rolling(20).mean()
+        hourly_df["bb_std"] = hourly_df["close"].rolling(20).std(ddof=0)
+        hourly_df["zscore"] = (
+            (hourly_df["close"] - hourly_df["bb_mid"]) /
+            hourly_df["bb_std"].replace(0, pd.NA)
+        )
+        hourly_df["vol_sma_20"] = hourly_df["volume"].rolling(20).mean()
+
+        latest = hourly_df.iloc[-1]
+        vol_sma = float(latest.get("vol_sma_20", 0) or 0)
+        volume_ratio = (float(latest["volume"]) / vol_sma) if vol_sma > 0 else 1.0
+        zscore_val = latest.get("zscore", 0)
+        if pd.isna(zscore_val):
+            zscore_val = 0.0
+
+        minute_df = self._get_minute_bars_df(ticker, days=2)
+        session_vwap = float(latest["close"])
+        orb_high = float(latest["high"])
+        orb_low = float(latest["low"])
+        if not minute_df.empty:
+            session_df = self._latest_session_slice(minute_df)
+            if not session_df.empty:
+                session_vwap = self._compute_session_vwap(minute_df)
+                orb_window = max(1, int(getattr(self.config.trading, "intraday_orb_minutes", 30)))
+                opening_range = session_df.head(orb_window)
+                if not opening_range.empty:
+                    orb_high = float(opening_range["high"].max())
+                    orb_low = float(opening_range["low"].min())
+
+        return {
+            "price": float(latest["close"]),
+            "macd": float(latest.get("macd", 0)),
+            "macd_signal": float(latest.get("macd_signal", 0)),
+            "rsi": float(latest.get("rsi", 50)),
+            "ema_50": float(latest.get("ema_50", 0)),
+            "atr_14": float(latest.get("atr_14", 0)),
+            "vwap": float(session_vwap),
+            "zscore": float(zscore_val),
+            "volume_ratio": volume_ratio,
+            "opening_range_high": orb_high,
+            "opening_range_low": orb_low,
+        }
+
+    def _compute_swing_indicators(self, ticker: str) -> dict | None:
+        df = self._get_daily_bars_df(ticker, days=130)
+        if df.empty or len(df) < 55:
+            self.logger.debug(f"{ticker}: insufficient daily bars ({len(df)})")
+            return None
+
+        ema_fast = self._ema(df["close"], 12)
+        ema_slow = self._ema(df["close"], 26)
+        df["macd"] = ema_fast - ema_slow
+        df["macd_signal"] = self._ema(df["macd"], 9)
+        df["rsi"] = self._rsi(df["close"], 14)
+        df["ema_50"] = self._ema(df["close"], 50)
+
+        h, l, c = df["high"], df["low"], df["close"]
+        tr = pd.concat([
+            h - l,
+            (h - c.shift()).abs(),
+            (l - c.shift()).abs(),
+        ], axis=1).max(axis=1)
+        df["atr_14"] = tr.ewm(span=14, adjust=False).mean()
+        df["bb_mid"] = df["close"].rolling(20).mean()
+        df["bb_std"] = df["close"].rolling(20).std(ddof=0)
+        df["zscore"] = (df["close"] - df["bb_mid"]) / df["bb_std"].replace(0, pd.NA)
+        df["vol_sma_20"] = df["volume"].rolling(20).mean()
+        df["vwap_20"] = (
+            (df["close"] * df["volume"]).rolling(20).sum() /
+            df["volume"].rolling(20).sum().replace(0, pd.NA)
+        )
+        df["breakout_20"] = df["high"].rolling(20).max()
+
+        latest = df.iloc[-1]
+        vol_sma = float(latest.get("vol_sma_20", 0) or 0)
+        volume_ratio = (float(latest["volume"]) / vol_sma) if vol_sma > 0 else 1.0
+        zscore_val = latest.get("zscore", 0)
+        if pd.isna(zscore_val):
+            zscore_val = 0.0
+        vwap_val = latest.get("vwap_20", latest["close"])
+        if pd.isna(vwap_val):
+            vwap_val = latest["close"]
+        orb_high = latest.get("breakout_20", latest["high"])
+        if pd.isna(orb_high):
+            orb_high = latest["high"]
+
+        return {
+            "price": float(latest["close"]),
+            "macd": float(latest.get("macd", 0)),
+            "macd_signal": float(latest.get("macd_signal", 0)),
+            "rsi": float(latest.get("rsi", 50)),
+            "ema_50": float(latest.get("ema_50", 0)),
+            "atr_14": float(latest.get("atr_14", 0)),
+            "vwap": float(vwap_val),
+            "zscore": float(zscore_val),
+            "volume_ratio": volume_ratio,
+            "opening_range_high": float(orb_high),
+            "opening_range_low": float(latest.get("low", 0)),
+        }
+
     def _compute_symbol_indicators(self, ticker: str) -> dict | None:
         try:
-            df = self._get_hourly_bars_df(ticker, days=12)
-            if df.empty or len(df) < 52:
-                self.logger.debug(f"{ticker}: insufficient hourly bars ({len(df)})")
-                return None
-
-            ema_fast         = self._ema(df["close"], 12)
-            ema_slow         = self._ema(df["close"], 26)
-            df["macd"]       = ema_fast - ema_slow
-            df["macd_signal"]= self._ema(df["macd"], 9)
-            df["rsi"]        = self._rsi(df["close"], 14)
-            df["ema_50"]     = self._ema(df["close"], 50)
-
-            # ATR
-            h, l, c = df["high"], df["low"], df["close"]
-            tr = pd.concat([
-                h - l,
-                (h - c.shift()).abs(),
-                (l - c.shift()).abs(),
-            ], axis=1).max(axis=1)
-            df["atr_14"] = tr.ewm(span=14, adjust=False).mean()
-
-            vol = df["volume"].replace(0, pd.NA)
-            df["vwap"]    = (df["close"] * vol).cumsum() / vol.cumsum()
-            df["bb_mid"]  = df["close"].rolling(20).mean()
-            df["bb_std"]  = df["close"].rolling(20).std(ddof=0)
-            df["zscore"]  = (df["close"] - df["bb_mid"]) / df["bb_std"].replace(0, pd.NA)
-            df["vol_sma_20"] = df["volume"].rolling(20).mean()
-
-            latest      = df.iloc[-1]
-            vol_sma     = float(latest.get("vol_sma_20", 0) or 0)
-            volume_ratio = (float(latest["volume"]) / vol_sma) if vol_sma > 0 else 1.0
-
-            zscore_val  = latest.get("zscore", 0)
-            if pd.isna(zscore_val):
-                zscore_val = 0.0
-
-            # Opening range: first 2 hourly bars of today
-            orb_high = float(latest["high"])
-            orb_low  = float(latest["low"])
-            if hasattr(df.index, "date"):
-                today      = df.index[-1].date()
-                today_bars = df[df.index.map(lambda x: x.date() == today)].head(2)
-                if not today_bars.empty:
-                    orb_high = float(today_bars["high"].max())
-                    orb_low  = float(today_bars["low"].min())
-
-            return {
-                "price":             float(latest["close"]),
-                "macd":              float(latest.get("macd", 0)),
-                "macd_signal":       float(latest.get("macd_signal", 0)),
-                "rsi":               float(latest.get("rsi", 50)),
-                "ema_50":            float(latest.get("ema_50", 0)),
-                "atr_14":            float(latest.get("atr_14", 0)),
-                "vwap":              float(latest.get("vwap", 0)),
-                "zscore":            float(zscore_val),
-                "volume_ratio":      volume_ratio,
-                "opening_range_high": orb_high,
-                "opening_range_low":  orb_low,
-            }
+            if self._is_swing_style():
+                return self._compute_swing_indicators(ticker)
+            return self._compute_intraday_indicators(ticker)
         except Exception as exc:
             self.logger.error(f"{ticker} indicator error: {exc}")
             return None
+
+    def _trade_count_this_week(self, now: datetime) -> int:
+        week_start = (now - timedelta(days=now.weekday())).date()
+        return sum(1 for ts in self._entry_timestamps if ts.date() >= week_start)
+
+    def _symbol_on_cooldown(self, ticker: str, now: datetime) -> bool:
+        cfg = self.config.trading
+        min_gap = int(getattr(cfg, "min_days_between_trades", 0))
+        symbol_cooldown = int(getattr(cfg, "symbol_cooldown_days", 0))
+        last_exit = self._last_exit_time.get(ticker)
+        if not last_exit:
+            return False
+        elapsed_days = (now.date() - last_exit.date()).days
+        return elapsed_days < min_gap or elapsed_days < symbol_cooldown
 
     def _compute_portfolio_signal(self, ticker: str, ind: dict) -> tuple[float, str]:
         price       = ind["price"]
@@ -714,7 +887,7 @@ class AlpacaTradingBot:
     # ================================================================
     #  ORDER EXECUTION
     # ================================================================
-    def _wait_for_fill(self, order_id: str, timeout: int = 30) -> "alpaca order object":
+    def _wait_for_fill(self, order_id: str, timeout: int = 30) -> object:
         """Poll order status until filled or timeout."""
         for _ in range(timeout):
             time.sleep(1)
@@ -777,6 +950,8 @@ class AlpacaTradingBot:
     #  SIGNAL EVALUATION (entry + exit)
     # ================================================================
     def flatten_intraday_positions(self):
+        if not self._style_settings["flatten_eod"]:
+            return
         if not self._is_market_open():
             self._log_market_closed_skip("flatten_intraday_positions")
             return
@@ -792,6 +967,7 @@ class AlpacaTradingBot:
             if sold:
                 self._algo_managed_positions.discard(ticker)
                 self._entry_strategy_reason.pop(ticker, None)
+                self._last_exit_time[ticker] = datetime.now()
                 self.logger.info(f"EOD FLATTEN: {ticker} qty={qty}")
 
     def evaluate_signals(self):
@@ -808,12 +984,12 @@ class AlpacaTradingBot:
                 return
 
             daily_loss = self._starting_cash - current_equity
-            if daily_loss > self.config.risk.max_daily_loss:
+            if daily_loss > self._style_settings["max_daily_loss"]:
                 self.logger.critical(f"DAILY LOSS LIMIT: ${daily_loss:,.2f}")
                 self._trading_enabled = False
                 self._send_alert_email(
                     "CIRCUIT BREAKER: Daily Loss Limit",
-                    f"Loss: ${daily_loss:,.2f} exceeds ${self.config.risk.max_daily_loss}",
+                    f"Loss: ${daily_loss:,.2f} exceeds ${self._style_settings['max_daily_loss']}",
                 )
                 return
 
@@ -867,16 +1043,22 @@ class AlpacaTradingBot:
                 )
 
                 should_exit, reason = False, ""
+                style = self._style_settings
 
-                if pnl_pct <= -self.config.trading.stop_loss_pct:
+                if pnl_pct <= -style["stop_loss_pct"]:
                     should_exit, reason = True, "stop_loss"
-                elif pnl_pct >= self.config.trading.take_profit_pct:
+                elif held_time >= timedelta(hours=style["min_hold_hours"]) and pnl_pct >= style["take_profit_pct"]:
                     should_exit, reason = True, "take_profit"
-                elif (held_time >= timedelta(hours=self.config.trading.profit_lock_hours)
-                      and pnl_pct >= self.config.trading.profit_lock_min_gain_pct):
+                elif (held_time >= timedelta(hours=style["profit_lock_hours"])
+                      and pnl_pct >= style["profit_lock_min_gain_pct"]):
                     should_exit, reason = True, "profit_lock"
-                elif held_time >= timedelta(days=self.config.trading.max_hold_days):
+                elif held_time >= timedelta(days=style["max_hold_days"]):
                     should_exit, reason = True, "time_exit"
+
+                trail_activation = avg_entry * (1 + style["trailing_activation_pct"])
+                trailing_stop = self.highest_price.get(ticker, current_price) * (1 - style["trailing_stop_pct"])
+                if self.highest_price.get(ticker, current_price) >= trail_activation and current_price <= trailing_stop:
+                    should_exit, reason = True, "trailing_stop"
 
                 if pnl_pct <= -0.05:
                     self.logger.critical(f"GAP DOWN: {ticker} at {pnl_pct:.2%}")
@@ -897,6 +1079,7 @@ class AlpacaTradingBot:
                         self._update_symbol_performance(ticker, pnl_dollar)
                         self._algo_managed_positions.discard(ticker)
                         self._entry_strategy_reason.pop(ticker, None)
+                        self._last_exit_time[ticker] = now
                         self.logger.info(f"EXIT {ticker}: {reason}, P&L ${pnl_dollar:.0f}")
 
             except Exception as exc:
@@ -928,9 +1111,15 @@ class AlpacaTradingBot:
         if self.cash < 4000:
             return
 
+        if self._is_swing_style() and self._trade_count_this_week(now) >= self.config.trading.max_weekly_trades:
+            self.logger.info("Weekly trade cap reached - skipping new swing entries")
+            return
+
         candidates: list[tuple[str, float, float, str]] = []
         for ticker in self._active_universe:
             if ticker == "SPY" or ticker in positions:
+                continue
+            if self._is_swing_style() and self._symbol_on_cooldown(ticker, now):
                 continue
 
             indicators = self._compute_symbol_indicators(ticker)
@@ -968,6 +1157,8 @@ class AlpacaTradingBot:
             self.entry_price[best_ticker]             = current_price
             self.highest_price[best_ticker]           = current_price
             self._entry_strategy_reason[best_ticker]  = reason
+            self._entry_timestamps.append(now)
+            self._last_entry_time[best_ticker] = now
 
             record = (
                 f"{now.strftime('%Y-%m-%d %H:%M')} BUY {best_ticker} "
@@ -1096,7 +1287,13 @@ class AlpacaTradingBot:
             msg = MIMEMultipart()
             msg["From"]    = cfg.sender_email
             msg["To"]      = cfg.recipient_email
-            msg["Subject"] = subject
+            subject_tag = "[ALPACA BOT]"
+            normalized_subject = subject.strip()
+            if not normalized_subject.startswith(subject_tag):
+                normalized_subject = f"{subject_tag} {normalized_subject}"
+            msg["Subject"] = normalized_subject
+            msg["X-Bot-Name"] = "ALPACA BOT"
+            msg["X-Bot-System"] = "EnhancedtradingBOTAlpaca"
             msg.attach(MIMEText(body, "plain"))
             server = smtplib.SMTP(cfg.smtp_server, cfg.smtp_port)
             server.starttls()
@@ -1120,10 +1317,6 @@ class AlpacaTradingBot:
             (9,  25, self.detect_market_regime,            "regime_morning"),
             (12,  0, self.detect_market_regime,            "regime_midday"),
             (15,  0, self.detect_market_regime,            "regime_afternoon"),
-            (9,  30, self.evaluate_signals,                "signals_morning"),
-            (12, 30, self.evaluate_signals,                "signals_midday"),
-            (15, 30, self.evaluate_signals,                "signals_afternoon"),
-            (15, 55, self.flatten_intraday_positions,      "flatten_eod"),
             (9,  35, self.send_portfolio_summary_email,    "email_morning"),
             (12, 30, self.send_portfolio_summary_email,    "email_midday"),
             (15, 30, self.send_portfolio_summary_email,    "email_afternoon"),
@@ -1138,6 +1331,35 @@ class AlpacaTradingBot:
                 id=job_id,
                 replace_existing=True,
             )
+
+        if self._is_intraday_style():
+            self.scheduler.add_job(
+                self._safe_run(self.evaluate_signals),
+                CronTrigger(hour=9, minute="30,45", day_of_week=mf),
+                id="signals_intraday_open",
+                replace_existing=True,
+            )
+            self.scheduler.add_job(
+                self._safe_run(self.evaluate_signals),
+                CronTrigger(hour="10-15", minute="*/15", day_of_week=mf),
+                id="signals_intraday_loop",
+                replace_existing=True,
+            )
+            if self._style_settings["flatten_eod"]:
+                self.scheduler.add_job(
+                    self._safe_run(self.flatten_intraday_positions),
+                    CronTrigger(hour=15, minute=55, day_of_week=mf),
+                    id="flatten_eod",
+                    replace_existing=True,
+                )
+        else:
+            for hour, minute, job_id in [(10, 0, "signals_swing_open"), (15, 30, "signals_swing_close")]:
+                self.scheduler.add_job(
+                    self._safe_run(self.evaluate_signals),
+                    CronTrigger(hour=hour, minute=minute, day_of_week=mf),
+                    id=job_id,
+                    replace_existing=True,
+                )
 
         self.scheduler.add_job(
             self._safe_run(self.send_weekly_summary_email),
@@ -1195,6 +1417,7 @@ class AlpacaTradingBot:
         self.logger.info("=" * 60)
         self.logger.info("ALPACA TRADING BOT STARTED")
         self.logger.info(f"Mode:          {mode}")
+        self.logger.info(f"Trading style: {self.trading_style}")
         self.logger.info(f"Paper trading: {self.config.alpaca.paper}")
         self.logger.info(f"Core symbols:  {self.config.universe.core_symbols}")
         self.logger.info(f"Active universe: {self._active_universe}")
@@ -1205,6 +1428,7 @@ class AlpacaTradingBot:
         self._send_alert_email(
             "Alpaca Trading Bot Started",
             f"Mode: {mode} (paper={self.config.alpaca.paper})\n"
+            f"Trading style: {self.trading_style}\n"
             f"Equity: ${self.net_liquidation:,.2f}\n"
             f"Regime: {self.market_regime}\n"
             f"Core Symbols: {', '.join(self.config.universe.core_symbols)}\n"
