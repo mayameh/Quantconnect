@@ -23,10 +23,10 @@ class BOT_Config:
     # Live:   https://api.alpaca.markets
     # ============================================================
     class alpaca:
-        api_key    = os.environ.get("ALPACA_API_KEY", "")
-        api_secret = os.environ.get("ALPACA_API_SECRET", "")
+        api_key    = os.environ.get("APCA_API_KEY_ID", "")
+        api_secret = os.environ.get("APCA_API_SECRET_KEY", "")
         # True  → paper-trading endpoint; False → live endpoint
-        paper      = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+        paper      = os.environ.get("APCA_API_PAPER", "true").lower() == "true"
 
     # ============================================================
     # RISK MANAGEMENT
@@ -118,8 +118,8 @@ class BOT_Config:
             "BOT_ALPACA_FINANCIALS_PATH", "/v1beta1/fundamentals/{symbol}"
         )
         # Reuse the same Alpaca credentials
-        fundamentals_api_key          = os.environ.get("ALPACA_API_KEY", "")
-        fundamentals_api_secret       = os.environ.get("ALPACA_API_SECRET", "")
+        fundamentals_api_key          = os.environ.get("APCA_API_KEY_ID", "")
+        fundamentals_api_secret       = os.environ.get("APCA_API_SECRET_KEY", "")
         fundamentals_timeout_seconds  = 8
         fundamentals_cache_hours      = 24
         fundamentals_fallback_to_static = True
@@ -164,8 +164,8 @@ class BOT_Config:
     # ============================================================
     class feeds:
         # Re-uses the same Alpaca credentials.
-        alpaca_api_key    = os.environ.get("ALPACA_API_KEY", "")
-        alpaca_api_secret = os.environ.get("ALPACA_API_SECRET", "")
+        alpaca_api_key    = os.environ.get("APCA_API_KEY_ID", "")
+        alpaca_api_secret = os.environ.get("APCA_API_SECRET_KEY", "")
 
         # Polling cadence for /v1beta1/news (5-min is comfortable on free tier)
         news_poll_interval_seconds: int = 300
