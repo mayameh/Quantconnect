@@ -210,6 +210,14 @@ class AlpacaTradingBot:
         """Return Alpaca account object (cached at most 5 s to avoid throttling)."""
         return self.trading_client.get_account()
 
+    def _alpaca_mode_label(self) -> str:
+        return "PAPER TRADING" if self.config.alpaca.paper else "LIVE TRADING"
+
+    def _alpaca_base_url(self) -> str:
+        if self.config.alpaca.paper:
+            return "https://paper-api.alpaca.markets"
+        return "https://api.alpaca.markets"
+
     @property
     def cash(self) -> float:
         try:
@@ -409,11 +417,34 @@ class AlpacaTradingBot:
             response.raise_for_status()
             growth = self._extract_revenue_growth_from_payload(response.json())
             if growth is None:
+                self.logger.warning(
+                    f"Fundamentals payload missing revenue growth for {ticker}: url={url}"
+                )
                 return None
             self._revenue_growth_cache[ticker] = (now_et, growth)
             return growth
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else "unknown"
+            body = ""
+            if response is not None:
+                try:
+                    body = (response.text or "")[:300].replace("\n", " ").strip()
+                except Exception:
+                    body = ""
+            self.logger.warning(
+                f"Fundamentals HTTP error for {ticker}: url={url}, status={status}, body={body or 'n/a'}"
+            )
+            return None
+        except requests.exceptions.RequestException as exc:
+            self.logger.warning(
+                f"Fundamentals request error for {ticker}: url={url}, error={exc}"
+            )
+            return None
         except Exception as exc:
-            self.logger.debug(f"External fundamentals fetch failed for {ticker}: {exc}")
+            self.logger.warning(
+                f"Fundamentals unexpected error for {ticker}: url={url}, error={exc}"
+            )
             return None
 
     def _score_dynamic_candidate(self, ticker: str) -> tuple[float, float, float] | None:
@@ -1207,6 +1238,8 @@ class AlpacaTradingBot:
             self._log_market_closed_skip("send_portfolio_summary_email")
             return
         try:
+            et = pytz.timezone("US/Eastern")
+            now_et = datetime.now(et)
             self._roll_schedule_stats_day()
             equity       = self.net_liquidation
             cash_val     = self.cash
@@ -1219,14 +1252,28 @@ class AlpacaTradingBot:
                 price = pos["market_price"]
                 avg   = pos["avg_cost"]
                 qty   = int(pos["qty"])
+                if price <= 0:
+                    live_price = self._get_price(ticker)
+                    if live_price > 0:
+                        price = live_price
+                    else:
+                        # Prevent false -100% P&L when broker omits current_price.
+                        price = avg
                 pnl   = qty * (price - avg)
                 pnl_pct = (price - avg) / avg if avg > 0 else 0
-                held  = datetime.now() - self.entry_time.get(ticker, datetime.now())
                 tag   = "ALGO" if ticker in self._algo_managed_positions else "MANUAL"
+                entry_dt = self.entry_time.get(ticker)
+                if entry_dt is None:
+                    held_str = "N/A"
+                else:
+                    held_delta = now_et - entry_dt
+                    if held_delta.total_seconds() < 0:
+                        held_delta = timedelta(0)
+                    held_str = str(held_delta).split('.')[0]
                 pos_lines.append(
                     f"  {ticker:<6} | Qty:{qty:<5} | Entry:${avg:<8.2f} | "
                     f"Now:${price:<8.2f} | P&L:${pnl:<8.2f} ({pnl_pct:>6.2%}) | "
-                    f"{tag} | {str(held).split('.')[0]}"
+                    f"{tag} | {held_str}"
                 )
 
             body = (
@@ -1248,13 +1295,14 @@ class AlpacaTradingBot:
             recent = list(self.trade_history)[-10:]
             body += ("\n".join(f"  {t}" for t in recent) + "\n") if recent else "  No recent trades\n"
 
-            body += f"\n{'=' * 70}\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            self._send_email(f"Portfolio Summary - {datetime.now().strftime('%Y-%m-%d %H:%M')}", body)
+            body += f"\n{'=' * 70}\nGenerated (US/Eastern): {now_et.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            self._send_email(f"Portfolio Summary - {now_et.strftime('%Y-%m-%d %H:%M')} ET", body)
         except Exception as exc:
             self.logger.error(f"Portfolio email error: {exc}")
 
     def send_weekly_summary_email(self):
         try:
+            now_et = datetime.now(pytz.timezone("US/Eastern"))
             equity  = self.net_liquidation
             total_return = (equity - self._starting_cash) / self._starting_cash if self._starting_cash > 0 else 0
             drawdown = ((self.peak_equity - equity) / self.peak_equity if self.peak_equity > 0 else 0)
@@ -1274,8 +1322,8 @@ class AlpacaTradingBot:
             )
             for t in list(self.trade_history)[-15:]:
                 body += f"  {t}\n"
-            body += f"\n{'=' * 80}\nWeekly Report: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            self._send_email(f"Weekly Portfolio Summary - {datetime.now().strftime('%Y-%m-%d')}", body)
+            body += f"\n{'=' * 80}\nWeekly Report (US/Eastern): {now_et.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            self._send_email(f"Weekly Portfolio Summary - {now_et.strftime('%Y-%m-%d')} ET", body)
         except Exception as exc:
             self.logger.error(f"Weekly email error: {exc}")
 
@@ -1312,6 +1360,7 @@ class AlpacaTradingBot:
     # ================================================================
     def _setup_scheduler(self):
         mf   = "mon-fri"
+        et   = pytz.timezone("US/Eastern")
         jobs = [
             (9,  20, self.refresh_dynamic_universe_if_due, "universe_refresh"),
             (9,  25, self.detect_market_regime,            "regime_morning"),
@@ -1327,7 +1376,7 @@ class AlpacaTradingBot:
         for hour, minute, func, job_id in jobs:
             self.scheduler.add_job(
                 self._safe_run(func),
-                CronTrigger(hour=hour, minute=minute, day_of_week=mf),
+                CronTrigger(hour=hour, minute=minute, day_of_week=mf, timezone=et),
                 id=job_id,
                 replace_existing=True,
             )
@@ -1335,20 +1384,20 @@ class AlpacaTradingBot:
         if self._is_intraday_style():
             self.scheduler.add_job(
                 self._safe_run(self.evaluate_signals),
-                CronTrigger(hour=9, minute="30,45", day_of_week=mf),
+                CronTrigger(hour=9, minute="30,45", day_of_week=mf, timezone=et),
                 id="signals_intraday_open",
                 replace_existing=True,
             )
             self.scheduler.add_job(
                 self._safe_run(self.evaluate_signals),
-                CronTrigger(hour="10-15", minute="*/15", day_of_week=mf),
+                CronTrigger(hour="10-15", minute="*/15", day_of_week=mf, timezone=et),
                 id="signals_intraday_loop",
                 replace_existing=True,
             )
             if self._style_settings["flatten_eod"]:
                 self.scheduler.add_job(
                     self._safe_run(self.flatten_intraday_positions),
-                    CronTrigger(hour=15, minute=55, day_of_week=mf),
+                    CronTrigger(hour=15, minute=55, day_of_week=mf, timezone=et),
                     id="flatten_eod",
                     replace_existing=True,
                 )
@@ -1356,14 +1405,14 @@ class AlpacaTradingBot:
             for hour, minute, job_id in [(10, 0, "signals_swing_open"), (15, 30, "signals_swing_close")]:
                 self.scheduler.add_job(
                     self._safe_run(self.evaluate_signals),
-                    CronTrigger(hour=hour, minute=minute, day_of_week=mf),
+                    CronTrigger(hour=hour, minute=minute, day_of_week=mf, timezone=et),
                     id=job_id,
                     replace_existing=True,
                 )
 
         self.scheduler.add_job(
             self._safe_run(self.send_weekly_summary_email),
-            CronTrigger(hour=16, minute=0, day_of_week="fri"),
+            CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=et),
             id="weekly_summary",
             replace_existing=True,
         )
@@ -1396,14 +1445,23 @@ class AlpacaTradingBot:
         signal.signal(signal.SIGINT,  self._signal_handler)
 
         # Verify credentials by fetching account
+        mode_label = self._alpaca_mode_label()
+        base_url = self._alpaca_base_url()
         try:
             account = self._get_account()
             self._starting_cash = float(account.portfolio_value)
             self.peak_equity    = self._starting_cash
-            mode_label = "PAPER" if self.config.alpaca.paper else "LIVE"
-            self.logger.info(f"Connected to Alpaca [{mode_label}] — equity: ${self._starting_cash:,.2f}")
+            self.logger.info(
+                f"Connected to Alpaca [{mode_label}] via {base_url} — equity: ${self._starting_cash:,.2f}"
+            )
         except Exception as exc:
-            self.logger.critical(f"Alpaca connection failed: {exc}")
+            self.logger.critical(
+                f"Alpaca connection failed on {mode_label} endpoint {base_url}: {exc}"
+            )
+            self.logger.critical(
+                "Check APCA_API_PAPER and make sure the API key/secret match that exact Alpaca account type. "
+                "Paper keys only work on paper-api; live keys only work on api.alpaca.markets."
+            )
             raise
 
         self._refresh_dynamic_universe(force=True)
@@ -1413,12 +1471,10 @@ class AlpacaTradingBot:
         self._setup_scheduler()
         self.scheduler.start()
 
-        mode = self.config.general.mode
         self.logger.info("=" * 60)
         self.logger.info("ALPACA TRADING BOT STARTED")
-        self.logger.info(f"Mode:          {mode}")
+        self.logger.info(f"Mode:          {mode_label}")
         self.logger.info(f"Trading style: {self.trading_style}")
-        self.logger.info(f"Paper trading: {self.config.alpaca.paper}")
         self.logger.info(f"Core symbols:  {self.config.universe.core_symbols}")
         self.logger.info(f"Active universe: {self._active_universe}")
         self.logger.info(f"Regime:        {self.market_regime}")
@@ -1427,11 +1483,13 @@ class AlpacaTradingBot:
 
         self._send_alert_email(
             "Alpaca Trading Bot Started",
-            f"Mode: {mode} (paper={self.config.alpaca.paper})\n"
-            f"Trading style: {self.trading_style}\n"
-            f"Equity: ${self.net_liquidation:,.2f}\n"
-            f"Regime: {self.market_regime}\n"
-            f"Core Symbols: {', '.join(self.config.universe.core_symbols)}\n"
+            f"Mode:          {mode_label}\n"
+            f"Trading Style: {self.trading_style}\n"
+            f"Equity:        ${self.net_liquidation:,.2f}\n"
+            f"Regime:        {self.market_regime}\n"
+            f"Core Symbols:  {', '.join(self.config.universe.core_symbols)}\n"
+            f"Dynamic Symbols: {', '.join(sorted(self._dynamic_symbols)) if self._dynamic_symbols else 'None'}\n"
+            f"Active Universe: {', '.join(self._active_universe)}\n"
         )
 
         try:

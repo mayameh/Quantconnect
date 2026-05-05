@@ -1216,6 +1216,8 @@ class TradingBot:
             self._log_market_closed_skip("send_portfolio_summary_email")
             return
         try:
+            et = pytz.timezone("US/Eastern")
+            now_et = datetime.now(et)
             self._roll_schedule_stats_day()
             equity = self.net_liquidation
             cash_val = self.cash
@@ -1234,14 +1236,28 @@ class TradingBot:
                 price = pos["market_price"]
                 avg = pos["avg_cost"]
                 qty = int(pos["qty"])
+                if price <= 0:
+                    live_price = self._get_price(ticker)
+                    if live_price > 0:
+                        price = live_price
+                    else:
+                        # Prevent false -100% P&L when live quote is temporarily unavailable.
+                        price = avg
                 pnl = qty * (price - avg)
                 pnl_pct = (price - avg) / avg if avg > 0 else 0
-                held = datetime.now() - self.entry_time.get(ticker, datetime.now())
                 pos_type = "ALGO" if ticker in self._algo_managed_positions else "MANUAL"
+                entry_dt = self.entry_time.get(ticker)
+                if entry_dt is None:
+                    held_str = "N/A"
+                else:
+                    held_delta = now_et - entry_dt
+                    if held_delta.total_seconds() < 0:
+                        held_delta = timedelta(0)
+                    held_str = str(held_delta).split('.')[0]
                 positions_summary.append(
                     f"  {ticker:<6} | Qty:{qty:<5} | Entry:${avg:<8.2f} | "
                     f"Now:${price:<8.2f} | P&L:${pnl:<8.2f} ({pnl_pct:>6.2%}) | "
-                    f"{pos_type} | {str(held).split('.')[0]}"
+                    f"{pos_type} | {held_str}"
                 )
 
             body = (
@@ -1268,8 +1284,7 @@ class TradingBot:
             else:
                 body += "  No recent trades\n"
 
-            et_now = datetime.now(pytz.timezone("US/Eastern"))
-            if et_now.hour == 16 and et_now.minute <= 5:
+            if now_et.hour == 16 and now_et.minute <= 5:
                 body += (
                     f"\nEOD SCHEDULE SUMMARY\n{'-' * 70}\n"
                     f"  Scheduled triggers today: {self._schedule_trigger_count}\n"
@@ -1277,16 +1292,16 @@ class TradingBot:
                 )
 
             body += f"\n{'=' * 70}\n"
-            body += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            body += f"Generated (US/Eastern): {now_et.strftime('%Y-%m-%d %H:%M:%S')}\n"
 
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-            self._send_email(f"Portfolio Summary - {now_str}", body)
+            self._send_email(f"Portfolio Summary - {now_et.strftime('%Y-%m-%d %H:%M')} ET", body)
 
         except Exception as e:
             self.logger.error(f"Portfolio email error: {e}")
 
     def send_weekly_summary_email(self):
         try:
+            now_et = datetime.now(pytz.timezone("US/Eastern"))
             equity = self.net_liquidation
             cash_val = self.cash
             total_return = (
@@ -1351,10 +1366,10 @@ class TradingBot:
                 body += f"  {t}\n"
 
             body += f"\n{'=' * 80}\n"
-            body += f"Weekly Report: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            body += f"Weekly Report (US/Eastern): {now_et.strftime('%Y-%m-%d %H:%M:%S')}\n"
 
             self._send_email(
-                f"Weekly Portfolio Summary - {datetime.now().strftime('%Y-%m-%d')}",
+                f"Weekly Portfolio Summary - {now_et.strftime('%Y-%m-%d')} ET",
                 body,
             )
         except Exception as e:
@@ -1392,6 +1407,7 @@ class TradingBot:
     def _setup_scheduler(self):
         """Configure APScheduler jobs matching the original QC schedule (ET)."""
         mf = "mon-fri"
+        et = pytz.timezone("US/Eastern")
         jobs = [
             # Dynamic universe refresh
             (9, 20, self.refresh_dynamic_universe_if_due, "universe_refresh"),
@@ -1416,7 +1432,7 @@ class TradingBot:
         for hour, minute, func, job_id in jobs:
             self.scheduler.add_job(
                 self._safe_run(func),
-                CronTrigger(hour=hour, minute=minute, day_of_week=mf),
+                CronTrigger(hour=hour, minute=minute, day_of_week=mf, timezone=et),
                 id=job_id,
                 replace_existing=True,
             )
@@ -1424,7 +1440,7 @@ class TradingBot:
         # Weekly summary — Friday 16:00
         self.scheduler.add_job(
             self._safe_run(self.send_weekly_summary_email),
-            CronTrigger(hour=16, minute=0, day_of_week="fri"),
+            CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=et),
             id="weekly_summary",
             replace_existing=True,
         )
