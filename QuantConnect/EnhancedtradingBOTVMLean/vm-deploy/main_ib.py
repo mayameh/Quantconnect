@@ -260,6 +260,15 @@ class TradingBot:
                 self._contracts[ticker] = contract
             self.ib.reqMktData(self._contracts[ticker], "", False, False)
             self.logger.debug(f"Subscribed: {ticker}")
+
+        for pos in self.ib.positions():
+            if pos.position == 0:
+                continue
+            ticker = pos.contract.symbol
+            if ticker not in self._contracts:
+                self._contracts[ticker] = pos.contract
+            self.ib.reqMktData(self._contracts[ticker], "", False, False)
+            self.logger.debug(f"Subscribed position: {ticker}")
         self.ib.sleep(2)  # Let initial ticks arrive
 
     # ================================================================
@@ -306,7 +315,8 @@ class TradingBot:
             if pos.position == 0:
                 continue
             ticker = pos.contract.symbol
-            market_price = self._get_price(ticker)
+            self._contracts[ticker] = pos.contract
+            market_price = self._get_price(ticker, pos.contract)
             result[ticker] = {
                 "qty": abs(pos.position),
                 "avg_cost": pos.avgCost,
@@ -316,11 +326,15 @@ class TradingBot:
             }
         return result
 
-    def _get_price(self, ticker: str) -> float:
+    def _get_price(self, ticker: str, contract: Stock | None = None) -> float:
         """Get latest price from streaming data."""
-        contract = self._contracts.get(ticker)
+        contract = contract or self._contracts.get(ticker)
         if not contract:
             return 0.0
+
+        if ticker not in self._contracts:
+            self._contracts[ticker] = contract
+
         t = self.ib.ticker(contract)
         if t:
             price = t.marketPrice()
@@ -329,6 +343,22 @@ class TradingBot:
             # Fallback to last close
             if t.close and t.close > 0:
                 return float(t.close)
+
+        try:
+            self.ib.reqMktData(contract, "", False, False)
+            snapshot = self.ib.reqTickers(contract)
+            if snapshot:
+                snap_ticker = snapshot[0]
+                snap_price = snap_ticker.marketPrice()
+                if snap_price and snap_price == snap_price and snap_price > 0:
+                    return float(snap_price)
+                if snap_ticker.last and snap_ticker.last > 0:
+                    return float(snap_ticker.last)
+                if snap_ticker.close and snap_ticker.close > 0:
+                    return float(snap_ticker.close)
+        except Exception as exc:
+            self.logger.debug(f"_get_price snapshot fallback failed for {ticker}: {exc}")
+
         return 0.0
 
     # ================================================================

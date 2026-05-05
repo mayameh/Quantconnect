@@ -241,10 +241,13 @@ class AlpacaTradingBot:
                 if qty == 0:
                     continue
                 ticker = pos.symbol
+                market_price = float(pos.current_price or 0)
+                if market_price <= 0:
+                    market_price = self._get_price(ticker)
                 result[ticker] = {
                     "qty": abs(qty),
                     "avg_cost": float(pos.avg_entry_price),
-                    "market_price": float(pos.current_price or 0),
+                    "market_price": market_price,
                     "side": "LONG" if qty > 0 else "SHORT",
                 }
         except Exception as exc:
@@ -252,7 +255,7 @@ class AlpacaTradingBot:
         return result
 
     def _get_price(self, ticker: str) -> float:
-        """Get latest price via Alpaca latest-bar endpoint."""
+        """Get latest price via Alpaca latest-bar endpoint with quote fallback."""
         try:
             req = StockLatestBarRequest(symbol_or_symbols=[ticker])
             bars = self.data_client.get_stock_latest_bar(req)
@@ -261,6 +264,23 @@ class AlpacaTradingBot:
                 return float(bar.close)
         except Exception as exc:
             self.logger.debug(f"_get_price {ticker}: {exc}")
+
+        try:
+            req = StockLatestQuoteRequest(symbol_or_symbols=[ticker])
+            quotes = self.data_client.get_stock_latest_quote(req)
+            quote = quotes.get(ticker)
+            if quote:
+                ask_price = float(getattr(quote, "ask_price", 0) or 0)
+                bid_price = float(getattr(quote, "bid_price", 0) or 0)
+                if ask_price > 0 and bid_price > 0:
+                    return (ask_price + bid_price) / 2.0
+                if ask_price > 0:
+                    return ask_price
+                if bid_price > 0:
+                    return bid_price
+        except Exception as exc:
+            self.logger.debug(f"_get_price quote fallback {ticker}: {exc}")
+
         return 0.0
 
     # ================================================================
