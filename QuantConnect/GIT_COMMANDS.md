@@ -19,9 +19,22 @@ git branch --show-current
 git push -u origin <current-branch>
 ```
 
-## Workspace repos
+## Create a new bot folder in this repo
 
-Use the matching block for the repo you are working in.
+If you want to create `tradingBOT-3SleeveHybridStrategy` as a new folder inside the QuantConnect repo, run this from the repo root:
+
+```bash
+cd ~/Library/CloudStorage/OneDrive-Personal/Mayank/Quantconnect
+mkdir -p QuantConnect/tradingBOT-3SleeveHybridStrategy
+git status
+git add QuantConnect/tradingBOT-3SleeveHybridStrategy
+git commit -m "Add tradingBOT-3SleeveHybridStrategy folder"
+git push -u Quantconnect feature/newtradingbotalpaca-intraday
+```
+
+## Workspace folders
+
+Use the matching block for the folder you are working in.
 
 ### EnhancedtradingBOT
 
@@ -134,10 +147,10 @@ git push -u origin main
 ### tradingBOT-3SleeveHybridStrategy
 
 ```bash
-cd ~/Library/CloudStorage/OneDrive-Personal/Mayank/Quantconnect/QuantConnect/tradingBOT-3SleeveHybridStrategy
+cd ~/Library/CloudStorage/OneDrive-Personal/Mayank/Quantconnect/Quantconnect/tradingBOT-3SleeveHybridStrategy
 git add -A
 git commit -m "Update tradingBOT-3SleeveHybridStrategy"
-git push -u origin main
+git push -u Quantconnect feature/newtradingbotalpaca-intraday
 ```
 
 ## Remote setup and fixes
@@ -183,6 +196,8 @@ If you want to switch `origin` to HTTPS first:
 git remote set-url origin https://github.com/mayameh/Quantconnect.git
 git push -u origin feature/newtradingbotalpaca-intraday
 ```
+
+If `git push -u origin main` returns `Permission denied (publickey)`, it means the SSH `origin` remote is not usable on this machine. Use the HTTPS `Quantconnect` remote above, or switch `origin` to HTTPS first.
 
 If you accidentally typed the add command wrong, the correct form is:
 
