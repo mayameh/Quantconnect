@@ -1,0 +1,2254 @@
+#!/usr/bin/env python3
+"""
+Trading Bot — Alpaca native version
+Connects to Alpaca Markets REST API (paper or live).
+Architecture: Scheduler → Bot → Alpaca REST API → Markets
+"""
+
+import logging
+import logging.handlers
+import signal
+import sys
+import os
+import json
+import math
+import smtplib
+import time
+import requests
+from datetime import datetime, timedelta, time as dt_time
+from collections import defaultdict, deque
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+import pandas as pd
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    GetOrdersRequest,
+    ClosePositionRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus as AlpacaOrderStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import (
+    StockBarsRequest,
+    StockLatestBarRequest,
+    StockLatestQuoteRequest,
+)
+from alpaca.data.timeframe import TimeFrame
+
+from new_bot_config import BOT_Config
+from new_live_feeds import FeedManager
+
+
+class AlpacaTradingBot:
+    """
+    Production trading bot using the Alpaca Markets API (alpaca-py SDK).
+    Paper-trading by default; set ALPACA_PAPER=false for live.
+    """
+
+    def __init__(self):
+        self.config = BOT_Config()
+        self._setup_logging()
+        self.logger.info("Initializing Alpaca Trading Bot...")
+
+        # ── Alpaca clients ──────────────────────────────────────────────
+        cfg = self.config.alpaca
+        self.trading_client = TradingClient(
+            cfg.api_key, cfg.api_secret, paper=cfg.paper
+        )
+        self.data_client = StockHistoricalDataClient(cfg.api_key, cfg.api_secret)
+
+        self.scheduler = BackgroundScheduler(timezone=pytz.timezone("US/Eastern"))
+
+        # ── State ─────────────────────────────────────────────────────
+        self._starting_cash: float = self.config.general.starting_capital
+        self.peak_equity: float = self._starting_cash
+        self.market_regime: str = "NEUTRAL"
+        self.trading_style: str = str(
+            getattr(self.config.general, "trading_style", "INTRADAY")
+        ).strip().upper()
+        if self.trading_style not in {"INTRADAY", "SWING"}:
+            self.trading_style = "INTRADAY"
+        self._style_settings = self._build_style_settings()
+
+        self._dynamic_symbols: set[str] = set()
+        self._active_universe: list[str] = list(self.config.universe.core_symbols)
+        self._last_universe_refresh: datetime | None = None
+        self._revenue_growth_cache: dict[str, tuple[datetime, float]] = {}
+        self._benchmark_return_cache: dict[tuple[str, str, int], tuple[datetime, float]] = {}
+
+        self._algo_managed_positions: set[str] = set()
+        self.entry_time: dict[str, datetime] = {}
+        self.entry_price: dict[str, float] = {}
+        self.highest_price: dict[str, float] = {}
+        self._entry_strategy_reason: dict[str, str] = {}
+        self._entry_timestamps: deque = deque(maxlen=200)
+        self._last_entry_time: dict[str, datetime] = {}
+        self._last_exit_time: dict[str, datetime] = {}
+        self._entry_side: dict[str, str] = {}
+        self._daily_entry_counts: dict[datetime.date, int] = {}
+
+        self._strategy_weights: dict[str, float] = {
+            "momentum":       0.40,   # primary trend signal
+            "mean_reversion": 0.00,   # disabled — contradicts intraday momentum strategy
+            "orb":            0.20,   # breakout confirmation
+            "vwap_twap":      0.30,   # pullback/proximity confirmation
+            "market_making":  0.05,
+            "stat_arb":       0.00,
+            "sentiment":      0.05,
+        }
+
+        self.symbols_to_trade: list[str] = []
+
+        # ── Live feeds ─────────────────────────────────────────────────
+        feeds_cfg = self.config.feeds
+        self._feeds = FeedManager(
+            api_key=feeds_cfg.alpaca_api_key,
+            api_secret=feeds_cfg.alpaca_api_secret,
+            news_poll_interval_seconds=feeds_cfg.news_poll_interval_seconds,
+        )
+        self._min_portfolio_signal_score: float = float(
+            getattr(self.config.trading, "entry_signal_score_threshold", 0.18)
+        )
+
+        self.trade_history: deque = deque(maxlen=50)
+        self.winning_trades: deque = deque(maxlen=30)
+        self.losing_trades: deque = deque(maxlen=20)
+        self._last_closed_log_key: dict[str, str] = {}
+        et_now = datetime.now(pytz.timezone("US/Eastern"))
+        self._schedule_stats_date = et_now.date()
+        self._schedule_trigger_count = 0
+        self._schedule_market_closed_skips = 0
+        self.symbol_performance: dict = defaultdict(
+            lambda: {"trades": 0, "wins": 0, "total_pnl": 0.0,
+                     "consecutive_losses": 0, "win_rate": 0.0}
+        )
+
+        self._trading_enabled: bool = True
+        self._running: bool = True
+        et_now = datetime.now(pytz.timezone("US/Eastern"))
+        self._risk_day = et_now.date()
+        self._session_start_equity: float = self._starting_cash
+        self._state_file = os.path.join(
+            getattr(self, "_runtime_log_dir", os.getcwd()),
+            "alpacabot_state.json",
+        )
+        self._load_state()
+
+    def _build_style_settings(self) -> dict:
+        cfg = self.config.trading
+        risk = self.config.risk
+        if self.trading_style == "SWING":
+            return {
+                "signal_source": "daily",
+                "flatten_eod": bool(getattr(cfg, "swing_flatten_positions", False)),
+                "stop_loss_pct": float(getattr(cfg, "swing_stop_loss_pct", cfg.stop_loss_pct)),
+                "take_profit_pct": float(getattr(cfg, "swing_take_profit_pct", cfg.take_profit_pct)),
+                "profit_lock_hours": int(getattr(cfg, "swing_profit_lock_hours", cfg.profit_lock_hours)),
+                "profit_lock_min_gain_pct": float(
+                    getattr(cfg, "swing_profit_lock_min_gain_pct", cfg.profit_lock_min_gain_pct)
+                ),
+                "trailing_stop_pct": float(getattr(cfg, "swing_trailing_stop_pct", cfg.trailing_stop_pct)),
+                "trailing_activation_pct": float(
+                    getattr(cfg, "swing_trailing_activation_pct", cfg.trailing_activation_pct)
+                ),
+                "max_daily_loss": max(
+                    float(getattr(risk, "max_daily_loss", 100)),
+                    float(getattr(risk, "swing_max_daily_loss", 250)),
+                ),
+                "min_hold_hours": int(getattr(cfg, "min_hold_hours", 24)),
+                "max_hold_days": int(getattr(cfg, "max_hold_days", 14)),
+            }
+
+        return {
+            "signal_source": "intraday",
+            "flatten_eod": bool(getattr(cfg, "intraday_flatten_positions", True)),
+            "stop_loss_pct": float(getattr(cfg, "intraday_stop_loss_pct", 0.01)),
+            "take_profit_pct": float(getattr(cfg, "intraday_take_profit_pct", 0.025)),
+            "profit_lock_hours": int(getattr(cfg, "intraday_profit_lock_hours", 3)),
+            "profit_lock_min_gain_pct": float(getattr(cfg, "intraday_profit_lock_min_gain_pct", 0.006)),
+            "trailing_stop_pct": float(getattr(cfg, "intraday_trailing_stop_pct", 0.008)),
+            "trailing_activation_pct": float(getattr(cfg, "intraday_trailing_activation_pct", 0.012)),
+            "max_daily_loss": max(
+                float(getattr(risk, "max_daily_loss", 100)),
+                float(getattr(risk, "intraday_max_daily_loss", 150)),
+            ),
+            "min_hold_hours": 0,
+            "max_hold_days": 1,
+        }
+
+    def _is_intraday_style(self) -> bool:
+        return self.trading_style == "INTRADAY"
+
+    def _is_swing_style(self) -> bool:
+        return self.trading_style == "SWING"
+
+    def _is_tech_momentum_strategy(self) -> bool:
+        return str(
+            getattr(self.config.trading, "strategy_mode", "")
+        ).strip().upper() == "TECH_MOMENTUM"
+
+    # ================================================================
+    #  LOGGING
+    # ================================================================
+    def _setup_logging(self):
+        preferred_log_dir = self.config.monitoring.log_dir
+        try:
+            os.makedirs(preferred_log_dir, exist_ok=True)
+            log_dir = preferred_log_dir
+        except PermissionError:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+
+        self.logger = logging.getLogger("AlpacaBot")
+        self.logger.setLevel(logging.DEBUG)
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+        self._runtime_log_dir = log_dir
+
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
+
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        self.logger.addHandler(ch)
+
+        fh = logging.handlers.RotatingFileHandler(
+            os.path.join(log_dir, "alpacabot.log"),
+            maxBytes=10_000_000,
+            backupCount=5,
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        self.logger.addHandler(fh)
+
+    @staticmethod
+    def _serialize_datetime(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.isoformat()
+        return value.astimezone(pytz.timezone("US/Eastern")).isoformat()
+
+    @staticmethod
+    def _deserialize_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    def _load_state(self):
+        try:
+            if not os.path.exists(self._state_file):
+                return
+            with open(self._state_file, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+
+            self._algo_managed_positions = {
+                str(symbol) for symbol in state.get("algo_managed_positions", [])
+            }
+
+            for key, target in {
+                "entry_time": self.entry_time,
+                "last_entry_time": self._last_entry_time,
+                "last_exit_time": self._last_exit_time,
+            }.items():
+                for symbol, raw_value in state.get(key, {}).items():
+                    dt_value = self._deserialize_datetime(raw_value)
+                    if dt_value is not None:
+                        target[str(symbol)] = dt_value
+
+            for key, target in {
+                "entry_price": self.entry_price,
+                "highest_price": self.highest_price,
+            }.items():
+                for symbol, raw_value in state.get(key, {}).items():
+                    target[str(symbol)] = self._safe_float(raw_value)
+
+            self._entry_strategy_reason = {
+                str(symbol): str(reason)
+                for symbol, reason in state.get("entry_strategy_reason", {}).items()
+            }
+            self._entry_side = {
+                str(symbol): str(side)
+                for symbol, side in state.get("entry_side", {}).items()
+            }
+            self.logger.info(
+                f"Loaded bot state for {len(self._algo_managed_positions)} tracked positions"
+            )
+        except Exception as exc:
+            self.logger.warning(f"State load error: {exc}")
+
+    def _save_state(self):
+        try:
+            state = {
+                "algo_managed_positions": sorted(self._algo_managed_positions),
+                "entry_time": {
+                    symbol: self._serialize_datetime(value)
+                    for symbol, value in self.entry_time.items()
+                },
+                "entry_price": self.entry_price,
+                "highest_price": self.highest_price,
+                "last_entry_time": {
+                    symbol: self._serialize_datetime(value)
+                    for symbol, value in self._last_entry_time.items()
+                },
+                "last_exit_time": {
+                    symbol: self._serialize_datetime(value)
+                    for symbol, value in self._last_exit_time.items()
+                },
+                "entry_strategy_reason": self._entry_strategy_reason,
+                "entry_side": self._entry_side,
+            }
+            with open(self._state_file, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, indent=2, sort_keys=True)
+        except Exception as exc:
+            self.logger.warning(f"State save error: {exc}")
+
+    def _reconcile_managed_state_with_positions(self):
+        positions = self._get_positions()
+        if not positions:
+            if self._algo_managed_positions:
+                self._algo_managed_positions.clear()
+                self._save_state()
+            return
+
+        changed = False
+        for symbol in list(self._algo_managed_positions):
+            if symbol not in positions:
+                self._algo_managed_positions.discard(symbol)
+                self.entry_time.pop(symbol, None)
+                self.entry_price.pop(symbol, None)
+                self.highest_price.pop(symbol, None)
+                self._entry_strategy_reason.pop(symbol, None)
+                self._entry_side.pop(symbol, None)
+                changed = True
+                continue
+
+            pos = positions[symbol]
+            if symbol not in self.entry_price:
+                self.entry_price[symbol] = self._safe_float(pos.get("avg_cost"))
+                changed = True
+            if symbol not in self.highest_price:
+                self.highest_price[symbol] = max(
+                    self._safe_float(pos.get("avg_cost")),
+                    self._safe_float(pos.get("market_price")),
+                )
+                changed = True
+            if symbol not in self.entry_time:
+                self.entry_time[symbol] = datetime.now(pytz.timezone("US/Eastern"))
+                changed = True
+
+        if changed:
+            self._save_state()
+
+    def _entry_score_threshold(self) -> float:
+        cfg = self.config.trading
+        if self._is_intraday_style():
+            return float(getattr(cfg, "intraday_entry_score_threshold", self._min_portfolio_signal_score))
+        if self._is_swing_style():
+            return float(getattr(cfg, "swing_entry_score_threshold", self._min_portfolio_signal_score))
+        if self.market_regime == "BULL":
+            return float(getattr(cfg, "bull_entry_score_threshold", self._min_portfolio_signal_score))
+        if self.market_regime == "NEUTRAL":
+            return float(getattr(cfg, "neutral_entry_score_threshold", self._min_portfolio_signal_score))
+        if self.market_regime == "BEAR":
+            return float(getattr(cfg, "bear_entry_score_threshold", self._min_portfolio_signal_score))
+        return self._min_portfolio_signal_score
+
+    def _roll_daily_risk_baseline(self, current_equity: float):
+        try:
+            today_et = datetime.now(pytz.timezone("US/Eastern")).date()
+            if today_et != self._risk_day:
+                self._risk_day = today_et
+                self._session_start_equity = current_equity
+                self._trading_enabled = True
+        except Exception:
+            pass
+
+    # ================================================================
+    #  ALPACA ACCOUNT HELPERS
+    # ================================================================
+    def _get_account(self):
+        """Return Alpaca account object (cached at most 5 s to avoid throttling)."""
+        return self.trading_client.get_account()
+
+    def _account_float(self, account, *field_names: str) -> float:
+        for field_name in field_names:
+            value = getattr(account, field_name, None)
+            parsed = self._safe_float(value)
+            if parsed > 0:
+                return parsed
+        return 0.0
+
+    def _alpaca_mode_label(self) -> str:
+        return "PAPER TRADING" if self.config.alpaca.paper else "LIVE TRADING"
+
+    def _alpaca_base_url(self) -> str:
+        if self.config.alpaca.paper:
+            return "https://paper-api.alpaca.markets"
+        return "https://api.alpaca.markets"
+
+    @property
+    def cash(self) -> float:
+        try:
+            return float(self._get_account().cash)
+        except Exception:
+            return 0.0
+
+    @property
+    def net_liquidation(self) -> float:
+        try:
+            return float(self._get_account().portfolio_value)
+        except Exception:
+            return 0.0
+
+    def _get_positions(self) -> dict:
+        """Return {ticker: {qty, avg_cost, market_price, side}}."""
+        result = {}
+        try:
+            for pos in self.trading_client.get_all_positions():
+                qty = float(pos.qty)
+                if qty == 0:
+                    continue
+                ticker = pos.symbol
+                market_price = float(pos.current_price or 0)
+                if market_price <= 0:
+                    market_price = self._get_price(ticker)
+                result[ticker] = {
+                    "qty": abs(qty),
+                    "avg_cost": float(pos.avg_entry_price),
+                    "market_price": market_price,
+                    "side": "LONG" if qty > 0 else "SHORT",
+                }
+        except Exception as exc:
+            self.logger.error(f"_get_positions error: {exc}")
+        return result
+
+    def _get_price(self, ticker: str) -> float:
+        """Get latest price via Alpaca latest-bar endpoint with quote fallback."""
+        try:
+            req = StockLatestBarRequest(symbol_or_symbols=[ticker])
+            bars = self.data_client.get_stock_latest_bar(req)
+            bar = bars.get(ticker)
+            if bar and bar.close and bar.close > 0:
+                return float(bar.close)
+        except Exception as exc:
+            self.logger.debug(f"_get_price {ticker}: {exc}")
+
+        try:
+            req = StockLatestQuoteRequest(symbol_or_symbols=[ticker])
+            quotes = self.data_client.get_stock_latest_quote(req)
+            quote = quotes.get(ticker)
+            if quote:
+                ask_price = float(getattr(quote, "ask_price", 0) or 0)
+                bid_price = float(getattr(quote, "bid_price", 0) or 0)
+                if ask_price > 0 and bid_price > 0:
+                    return (ask_price + bid_price) / 2.0
+                if ask_price > 0:
+                    return ask_price
+                if bid_price > 0:
+                    return bid_price
+        except Exception as exc:
+            self.logger.debug(f"_get_price quote fallback {ticker}: {exc}")
+
+        return 0.0
+
+    # ================================================================
+    #  DYNAMIC UNIVERSE SELECTION
+    # ================================================================
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _build_active_universe(self):
+        merged = list(self.config.universe.core_symbols) + sorted(self._dynamic_symbols)
+        seen: set = set()
+        self._active_universe = [t for t in merged if not (t in seen or seen.add(t))]
+        self._feeds.update_symbols(self._active_universe)
+
+    def _get_daily_bars_df(self, ticker: str, days: int = 130) -> pd.DataFrame:
+        """Fetch daily bars via Alpaca SDK, return clean DataFrame."""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=[ticker],
+                timeframe=TimeFrame.Day,
+                start=datetime.now() - timedelta(days=days),
+                end=datetime.now(),
+            )
+            bar_set = self.data_client.get_stock_bars(req)
+            df = bar_set.df
+            if isinstance(df.index, pd.MultiIndex):
+                # (symbol, timestamp) multi-index — drop symbol level
+                df = df.xs(ticker, level="symbol") if ticker in df.index.get_level_values("symbol") else pd.DataFrame()
+            df = df.copy()
+            df.columns = [str(c).lower() for c in df.columns]
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("US/Eastern")
+            return df
+        except Exception as exc:
+            self.logger.debug(f"_get_daily_bars_df {ticker}: {exc}")
+            return pd.DataFrame()
+
+    def _get_tech_momentum_universe(self) -> list[str]:
+        cfg = self.config.universe
+        excludes = set(getattr(cfg, "exclude_symbols", []))
+        symbols = list(getattr(cfg, "candidate_symbols", [])) or list(getattr(cfg, "core_symbols", []))
+        seen: set[str] = set()
+        return [
+            str(symbol).upper()
+            for symbol in symbols
+            if str(symbol).upper() not in excludes
+            and not (str(symbol).upper() in seen or seen.add(str(symbol).upper()))
+        ]
+
+    def _score_tech_momentum_symbol(self, ticker: str) -> tuple[float, float] | None:
+        trading_cfg = self.config.trading
+        lookback = int(getattr(trading_cfg, "tech_momentum_lookback_days", 126))
+        min_dollar_volume = float(
+            getattr(trading_cfg, "tech_momentum_min_dollar_volume", 10_000_000)
+        )
+        df = self._get_daily_bars_df(ticker, days=lookback + 50)
+        if df.empty or len(df) < lookback + 1:
+            return None
+        close = df["close"].dropna()
+        if len(close) < lookback + 1:
+            return None
+        current_price = self._safe_float(close.iloc[-1])
+        lookback_price = self._safe_float(close.iloc[-(lookback + 1)])
+        if current_price <= 0 or lookback_price <= 0:
+            return None
+        recent = df.tail(20).copy()
+        if "volume" not in recent.columns:
+            return None
+        avg_dollar_volume = self._safe_float((recent["close"] * recent["volume"]).mean())
+        if avg_dollar_volume < min_dollar_volume:
+            return None
+        return (current_price / lookback_price) - 1.0, current_price
+
+    def rebalance_tech_momentum(self):
+        if not self._is_market_open():
+            self._log_market_closed_skip("rebalance_tech_momentum")
+            return
+
+        scored: list[tuple[str, float, float]] = []
+        for ticker in self._get_tech_momentum_universe():
+            result = self._score_tech_momentum_symbol(ticker)
+            if result is None:
+                continue
+            momentum, price = result
+            scored.append((ticker, momentum, price))
+            time.sleep(float(getattr(self.config.universe, "request_pause_seconds", 0.25)))
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        top_count = int(getattr(self.config.trading, "tech_momentum_top_count", 10))
+        selected = [ticker for ticker, _, _ in scored[:top_count]]
+        self.symbols_to_trade = selected
+        selected_set = set(selected)
+
+        positions = self._get_positions()
+        for ticker, pos in list(positions.items()):
+            if ticker not in self._algo_managed_positions:
+                continue
+            if ticker in selected_set:
+                continue
+            qty = float(pos.get("qty", 0))
+            if qty > 0 and self._place_market_sell(ticker, qty, "weekly_momentum_rebalance"):
+                self._algo_managed_positions.discard(ticker)
+                self.highest_price.pop(ticker, None)
+                self.entry_price.pop(ticker, None)
+                self.entry_time.pop(ticker, None)
+                self._entry_strategy_reason.pop(ticker, None)
+                self._entry_side.pop(ticker, None)
+
+        account_equity = self.net_liquidation
+        target_exposure = float(getattr(self.config.trading, "tech_momentum_target_exposure", 1.0))
+        if not selected or account_equity <= 0:
+            self._save_state()
+            return
+
+        target_value = account_equity * target_exposure / len(selected)
+        available_cash = self.cash
+        for ticker, _, price in scored[:top_count]:
+            live_price = self._get_price(ticker)
+            if live_price > 0:
+                price = live_price
+            if price <= 0:
+                continue
+            current_value = 0.0
+            pos = self._get_positions().get(ticker)
+            if pos:
+                current_value = self._safe_float(pos.get("qty")) * self._safe_float(pos.get("market_price"), price)
+            delta_value = target_value - current_value
+            if pos and delta_value <= max(25.0, price):
+                if pos:
+                    self._algo_managed_positions.add(ticker)
+                    self.highest_price[ticker] = max(self.highest_price.get(ticker, price), price)
+                continue
+            if not pos and delta_value <= 25.0:
+                continue
+            if available_cash <= 25.0:
+                break
+            delta_value = min(delta_value, available_cash)
+            qty = round(delta_value / price, 6)
+            if qty <= 0:
+                continue
+            if self._place_market_buy(ticker, qty):
+                available_cash -= qty * price
+                now = datetime.now(pytz.timezone("US/Eastern"))
+                self._algo_managed_positions.add(ticker)
+                self.entry_time.setdefault(ticker, now)
+                self.entry_price.setdefault(ticker, price)
+                self.highest_price[ticker] = max(self.highest_price.get(ticker, price), price)
+                self._entry_strategy_reason[ticker] = "tech_universe_126d_momentum"
+                self._entry_side[ticker] = "LONG"
+                self.trade_history.append(
+                    f"{now.strftime('%Y-%m-%d %H:%M')} BUY {ticker} - Qty: {qty} "
+                    f"@ ${price:.2f} | weekly momentum rebalance"
+                )
+
+        self._save_state()
+        self.logger.info(
+            "Tech momentum rebalance selected: "
+            + ", ".join(f"{ticker}({momentum:.1%})" for ticker, momentum, _ in scored[:top_count])
+        )
+
+    def check_tech_momentum_trailing_stops(self):
+        if not self._is_market_open():
+            self._log_market_closed_skip("check_tech_momentum_trailing_stops")
+            return
+        stop_pct = float(getattr(self.config.trading, "tech_momentum_stop_loss_pct", 0.05))
+        positions = self._get_positions()
+        changed = False
+        for ticker in list(self._algo_managed_positions):
+            pos = positions.get(ticker)
+            if not pos:
+                self.highest_price.pop(ticker, None)
+                continue
+            qty = float(pos.get("qty", 0))
+            price = self._safe_float(pos.get("market_price")) or self._get_price(ticker)
+            if qty <= 0 or price <= 0:
+                continue
+            self.highest_price[ticker] = max(self.highest_price.get(ticker, price), price)
+            stop_price = self.highest_price[ticker] * (1 - stop_pct)
+            if price < stop_price and self._place_market_sell(ticker, qty, "tech_momentum_trailing_stop"):
+                self.logger.info(
+                    f"Trailing stop hit for {ticker} at ${price:.2f}; high was ${self.highest_price[ticker]:.2f}"
+                )
+                self._algo_managed_positions.discard(ticker)
+                self.highest_price.pop(ticker, None)
+                self.entry_price.pop(ticker, None)
+                self.entry_time.pop(ticker, None)
+                self._entry_strategy_reason.pop(ticker, None)
+                self._entry_side.pop(ticker, None)
+                changed = True
+        if changed:
+            self._save_state()
+
+    def _get_hourly_bars_df(self, ticker: str, days: int = 12) -> pd.DataFrame:
+        """Fetch hourly bars via Alpaca SDK, return clean DataFrame."""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=[ticker],
+                timeframe=TimeFrame.Hour,
+                start=datetime.now() - timedelta(days=days),
+                end=datetime.now(),
+            )
+            bar_set = self.data_client.get_stock_bars(req)
+            df = bar_set.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(ticker, level="symbol") if ticker in df.index.get_level_values("symbol") else pd.DataFrame()
+            df = df.copy()
+            df.columns = [str(c).lower() for c in df.columns]
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("US/Eastern")
+            return df
+        except Exception as exc:
+            self.logger.debug(f"_get_hourly_bars_df {ticker}: {exc}")
+            return pd.DataFrame()
+
+    def _get_minute_bars_df(self, ticker: str, days: int = 2) -> pd.DataFrame:
+        """Fetch minute bars for session VWAP and opening-range calculations."""
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=[ticker],
+                timeframe=TimeFrame.Minute,
+                start=datetime.now() - timedelta(days=days),
+                end=datetime.now(),
+            )
+            bar_set = self.data_client.get_stock_bars(req)
+            df = bar_set.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(ticker, level="symbol") if ticker in df.index.get_level_values("symbol") else pd.DataFrame()
+            df = df.copy()
+            df.columns = [str(c).lower() for c in df.columns]
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("US/Eastern")
+            return df
+        except Exception as exc:
+            self.logger.debug(f"_get_minute_bars_df {ticker}: {exc}")
+            return pd.DataFrame()
+
+    def _latest_session_slice(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or not hasattr(df.index, "date"):
+            return pd.DataFrame()
+        session_date = df.index[-1].date()
+        return df[df.index.map(lambda x: x.date() == session_date)].copy()
+
+    def _compute_session_vwap(self, df: pd.DataFrame) -> float:
+        session = self._latest_session_slice(df)
+        if session.empty:
+            return 0.0
+        vol = session["volume"].replace(0, pd.NA)
+        session_vwap = ((session["close"] * vol).cumsum() / vol.cumsum()).iloc[-1]
+        if pd.isna(session_vwap):
+            return float(session["close"].iloc[-1])
+        return float(session_vwap)
+
+    def _recent_benchmark_return(self, symbol: str, timeframe: str, lookback: int) -> float:
+        now_et = datetime.now(pytz.timezone("US/Eastern"))
+        key = (symbol.upper(), timeframe, int(lookback))
+        cached = self._benchmark_return_cache.get(key)
+        if cached and now_et - cached[0] < timedelta(minutes=5):
+            return cached[1]
+
+        df = (
+            self._get_hourly_bars_df(symbol, days=12)
+            if timeframe == "hourly"
+            else self._get_daily_bars_df(symbol, days=max(130, lookback + 20))
+        )
+        value = 0.0
+        if not df.empty and len(df) >= lookback + 1:
+            current = self._safe_float(df["close"].iloc[-1])
+            prior = self._safe_float(df["close"].iloc[-(lookback + 1)])
+            if current > 0 and prior > 0:
+                value = (current / prior) - 1.0
+        self._benchmark_return_cache[key] = (now_et, value)
+        return value
+
+    def _extract_revenue_growth_from_payload(self, payload) -> float | None:
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            for key in ["revenueGrowth", "revenue_growth", "revenue_growth_yoy",
+                        "revenue_growth_1y", "revenue_growth_ttm"]:
+                if key in payload:
+                    return self._safe_float(payload.get(key), 0.0)
+            for nested_key in ["fundamentals", "financials", "data", "results", "result"]:
+                if nested_key in payload:
+                    growth = self._extract_revenue_growth_from_payload(payload[nested_key])
+                    if growth is not None:
+                        return growth
+        if isinstance(payload, list) and len(payload) >= 2:
+            latest = payload[0] if isinstance(payload[0], dict) else {}
+            prior  = payload[1] if isinstance(payload[1], dict) else {}
+            latest_rev = self._safe_float(latest.get("revenue"), 0.0)
+            prior_rev  = self._safe_float(prior.get("revenue"), 0.0)
+            if latest_rev > 0 and prior_rev > 0:
+                return (latest_rev / prior_rev) - 1.0
+        return None
+
+    def _get_revenue_growth_external(self, ticker: str) -> float | None:
+        cfg = self.config.universe
+        if not getattr(cfg, "fundamentals_external_enabled", False):
+            return None
+        api_key    = str(getattr(cfg, "fundamentals_api_key", "")).strip()
+        api_secret = str(getattr(cfg, "fundamentals_api_secret", "")).strip()
+        if not api_key or not api_secret:
+            return None
+
+        now_et = datetime.now(pytz.timezone("US/Eastern"))
+        cache_hours = max(1, int(getattr(cfg, "fundamentals_cache_hours", 24)))
+        cached = self._revenue_growth_cache.get(ticker)
+        if cached:
+            cached_time, cached_value = cached
+            if now_et - cached_time < timedelta(hours=cache_hours):
+                return cached_value
+
+        try:
+            timeout_sec   = max(2, int(getattr(cfg, "fundamentals_timeout_seconds", 8)))
+            base_url      = str(getattr(cfg, "fundamentals_base_url", "https://data.alpaca.markets")).rstrip("/")
+            path_template = str(getattr(cfg, "fundamentals_path_template", "/v1beta1/fundamentals/{symbol}"))
+            url = f"{base_url}{path_template.format(symbol=ticker)}"
+            headers = {
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": api_secret,
+                "accept": "application/json",
+            }
+            response = requests.get(url, headers=headers, timeout=timeout_sec)
+            response.raise_for_status()
+            growth = self._extract_revenue_growth_from_payload(response.json())
+            if growth is None:
+                self.logger.warning(
+                    f"Fundamentals payload missing revenue growth for {ticker}: url={url}"
+                )
+                return None
+            self._revenue_growth_cache[ticker] = (now_et, growth)
+            return growth
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else "unknown"
+            body = ""
+            if response is not None:
+                try:
+                    body = (response.text or "")[:300].replace("\n", " ").strip()
+                except Exception:
+                    body = ""
+            self.logger.warning(
+                f"Fundamentals HTTP error for {ticker}: url={url}, status={status}, body={body or 'n/a'}"
+            )
+            return None
+        except requests.exceptions.RequestException as exc:
+            self.logger.warning(
+                f"Fundamentals request error for {ticker}: url={url}, error={exc}"
+            )
+            return None
+        except Exception as exc:
+            self.logger.warning(
+                f"Fundamentals unexpected error for {ticker}: url={url}, error={exc}"
+            )
+            return None
+
+    def _score_dynamic_candidate(self, ticker: str) -> tuple[float, float, float] | None:
+        cfg = self.config.universe
+        lookback  = int(getattr(cfg, "momentum_lookback_days", 22))
+        vol_window = int(getattr(cfg, "avg_volume_window_days", 20))
+        min_required = max(lookback + 1, vol_window)
+
+        df = self._get_daily_bars_df(ticker, days=130)
+        if df.empty or len(df) < min_required + 1:
+            return None
+
+        close_series = df["close"].dropna()
+        if len(close_series) < min_required + 1:
+            return None
+
+        current_price  = self._safe_float(close_series.iloc[-1])
+        lookback_price = self._safe_float(close_series.iloc[-(lookback + 1)])
+        if current_price <= 0 or lookback_price <= 0:
+            return None
+
+        min_price = self._safe_float(getattr(cfg, "min_price", 0.0), 0.0)
+        if current_price < min_price:
+            return None
+
+        if "volume" not in df.columns:
+            return None
+
+        recent = df.tail(vol_window).copy()
+        recent["dollar_vol"] = recent["close"] * recent["volume"]
+        avg_dollar_vol = self._safe_float(recent["dollar_vol"].mean())
+        min_dollar_vol = self._safe_float(getattr(cfg, "min_avg_dollar_volume", 0.0), 0.0)
+        if avg_dollar_vol < min_dollar_vol:
+            return None
+
+        momentum       = (current_price / lookback_price) - 1.0
+        revenue_growth = self._get_revenue_growth_external(ticker)
+        if revenue_growth is None:
+            if getattr(cfg, "fundamentals_fallback_to_static", True):
+                rev_map        = getattr(cfg, "revenue_growth_1y", {})
+                revenue_growth = self._safe_float(rev_map.get(ticker, 0.0), 0.0)
+            else:
+                revenue_growth = 0.0
+
+        w_mom = self._safe_float(getattr(cfg, "momentum_weight", 0.6), 0.6)
+        w_rev = self._safe_float(getattr(cfg, "revenue_growth_weight", 0.4), 0.4)
+        score = (w_mom * momentum) + (w_rev * revenue_growth)
+        return score, momentum, revenue_growth
+
+    def refresh_dynamic_universe_if_due(self):
+        try:
+            self._refresh_dynamic_universe(force=False)
+        except Exception as exc:
+            self.logger.error(f"Universe refresh job error: {exc}")
+
+    def _refresh_dynamic_universe(self, force: bool = False):
+        cfg       = self.config.universe
+        if not getattr(cfg, "dynamic_enabled", False):
+            self._dynamic_symbols = set()
+            self._build_active_universe()
+            return
+
+        et      = pytz.timezone("US/Eastern")
+        now_et  = datetime.now(et)
+        refresh_days = max(1, int(getattr(cfg, "refresh_days", 14)))
+
+        if not force and self._last_universe_refresh is not None:
+            if (now_et.date() - self._last_universe_refresh.date()).days < refresh_days:
+                return
+
+        core      = set(self.config.universe.core_symbols)
+        excludes  = set(getattr(cfg, "exclude_symbols", []))
+        candidates = [
+            t for t in getattr(cfg, "candidate_symbols", [])
+            if t not in core and t not in excludes
+        ]
+
+        if not candidates:
+            self._dynamic_symbols = set()
+            self._build_active_universe()
+            return
+
+        scored: list[tuple[str, float, float, float]] = []
+        pause_sec = self._safe_float(getattr(cfg, "request_pause_seconds", 0.25), 0.25)
+        for ticker in candidates:
+            try:
+                result = self._score_dynamic_candidate(ticker)
+                if result is None:
+                    continue
+                score, momentum, revenue_growth = result
+                scored.append((ticker, score, momentum, revenue_growth))
+            except Exception as exc:
+                self.logger.debug(f"Universe candidate error {ticker}: {exc}")
+            if pause_sec > 0:
+                time.sleep(pause_sec)
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_n    = max(0, int(getattr(cfg, "top_n_dynamic", 10)))
+        selected = [t for t, _, _, _ in scored[:top_n]]
+        self._dynamic_symbols        = set(selected)
+        self._build_active_universe()
+        self._last_universe_refresh  = now_et
+
+        if selected:
+            top_msg = ", ".join(
+                [f"{t}(score={s:.3f}, mom={m:.1%}, rev={r:.1%})" for t, s, m, r in scored[:top_n]]
+            )
+            self.logger.info(f"Universe refreshed ({refresh_days}d cadence): {top_msg}")
+        else:
+            self.logger.warning("Universe refreshed but no dynamic symbols passed filters")
+
+    # ================================================================
+    #  INDICATORS  (computed from Alpaca bars via pandas)
+    # ================================================================
+    @staticmethod
+    def _ema(series: pd.Series, span: int) -> pd.Series:
+        return series.ewm(span=span, adjust=False).mean()
+
+    @staticmethod
+    def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+        delta     = series.diff()
+        gain      = delta.clip(lower=0)
+        loss      = -delta.clip(upper=0)
+        avg_gain  = gain.ewm(alpha=1 / length, adjust=False).mean()
+        avg_loss  = loss.ewm(alpha=1 / length, adjust=False).mean()
+        rs        = avg_gain / avg_loss.replace(0, pd.NA)
+        return 100 - (100 / (1 + rs))
+
+    def _compute_spy_indicators(self) -> dict | None:
+        try:
+            df = self._get_daily_bars_df("SPY", days=110)
+            if df.empty or len(df) < 55:
+                self.logger.warning("Insufficient SPY daily bars for indicators")
+                return None
+
+            df["ema_20"] = self._ema(df["close"], 20)
+            df["ema_50"] = self._ema(df["close"], 50)
+            df["rsi"]    = self._rsi(df["close"], 14)
+
+            latest = df.iloc[-1]
+            prev   = df.iloc[-2]
+
+            return {
+                "price":        float(latest["close"]),
+                "ema_20":       float(latest["ema_20"]),
+                "ema_50":       float(latest["ema_50"]),
+                "ema_20_prev":  float(prev["ema_20"]),
+                "ema_50_prev":  float(prev["ema_50"]),
+                "rsi":          float(latest["rsi"]) if pd.notna(latest["rsi"]) else None,
+            }
+        except Exception as exc:
+            self.logger.error(f"SPY indicator error: {exc}")
+            return None
+
+    def _compute_intraday_indicators(self, ticker: str) -> dict | None:
+        hourly_df = self._get_hourly_bars_df(ticker, days=12)
+        if hourly_df.empty or len(hourly_df) < 52:
+            self.logger.debug(f"{ticker}: insufficient hourly bars ({len(hourly_df)})")
+            return None
+
+        ema_fast = self._ema(hourly_df["close"], 12)
+        ema_slow = self._ema(hourly_df["close"], 26)
+        hourly_df["macd"] = ema_fast - ema_slow
+        hourly_df["macd_signal"] = self._ema(hourly_df["macd"], 9)
+        hourly_df["rsi"] = self._rsi(hourly_df["close"], 14)
+        hourly_df["ema_50"] = self._ema(hourly_df["close"], 50)
+
+        h, l, c = hourly_df["high"], hourly_df["low"], hourly_df["close"]
+        tr = pd.concat([
+            h - l,
+            (h - c.shift()).abs(),
+            (l - c.shift()).abs(),
+        ], axis=1).max(axis=1)
+        hourly_df["atr_14"] = tr.ewm(span=14, adjust=False).mean()
+        hourly_df["bb_mid"] = hourly_df["close"].rolling(20).mean()
+        hourly_df["bb_std"] = hourly_df["close"].rolling(20).std(ddof=0)
+        hourly_df["zscore"] = (
+            (hourly_df["close"] - hourly_df["bb_mid"]) /
+            hourly_df["bb_std"].replace(0, pd.NA)
+        )
+        hourly_df["vol_sma_20"] = hourly_df["volume"].rolling(20).mean()
+
+        latest = hourly_df.iloc[-1]
+        prev_close = float(hourly_df["close"].iloc[-2]) if len(hourly_df) >= 2 else float(latest["close"])
+        vol_sma = float(latest.get("vol_sma_20", 0) or 0)
+        volume_ratio = (float(latest["volume"]) / vol_sma) if vol_sma > 0 else 1.0
+        zscore_val = latest.get("zscore", 0)
+        if pd.isna(zscore_val):
+            zscore_val = 0.0
+        range_span = max(float(latest["high"] - latest["low"]), 1e-9)
+        close_location = (float(latest["close"]) - float(latest["low"])) / range_span
+        daily_return_1 = ((float(latest["close"]) / prev_close) - 1.0) if prev_close > 0 else 0.0
+        benchmark_symbol = str(
+            getattr(self.config.trading, "intraday_benchmark_symbol", "QQQ")
+        ).upper()
+        benchmark_return_1 = self._recent_benchmark_return(benchmark_symbol, "hourly", 1)
+
+        minute_df = self._get_minute_bars_df(ticker, days=2)
+        session_vwap = float(latest["close"])
+        orb_high = float(latest["high"])
+        orb_low = float(latest["low"])
+        if not minute_df.empty:
+            session_df = self._latest_session_slice(minute_df)
+            if not session_df.empty:
+                session_vwap = self._compute_session_vwap(minute_df)
+                orb_window = max(1, int(getattr(self.config.trading, "intraday_orb_minutes", 30)))
+                opening_range = session_df.head(orb_window)
+                if not opening_range.empty:
+                    orb_high = float(opening_range["high"].max())
+                    orb_low = float(opening_range["low"].min())
+
+        return {
+            "price": float(latest["close"]),
+            "macd": float(latest.get("macd", 0)),
+            "macd_signal": float(latest.get("macd_signal", 0)),
+            "rsi": float(latest.get("rsi", 50)),
+            "ema_50": float(latest.get("ema_50", 0)),
+            "atr_14": float(latest.get("atr_14", 0)),
+            "vwap": float(session_vwap),
+            "zscore": float(zscore_val),
+            "volume_ratio": volume_ratio,
+            "opening_range_high": orb_high,
+            "opening_range_low": orb_low,
+            "close_location": close_location,
+            "daily_return_1": daily_return_1,
+            "benchmark_return_1": benchmark_return_1,
+        }
+
+    def _compute_swing_indicators(self, ticker: str) -> dict | None:
+        df = self._get_daily_bars_df(ticker, days=130)
+        if df.empty or len(df) < 55:
+            self.logger.debug(f"{ticker}: insufficient daily bars ({len(df)})")
+            return None
+
+        df["ema_20"] = self._ema(df["close"], 20)
+        ema_fast = self._ema(df["close"], 12)
+        ema_slow = self._ema(df["close"], 26)
+        df["macd"] = ema_fast - ema_slow
+        df["macd_signal"] = self._ema(df["macd"], 9)
+        df["rsi"] = self._rsi(df["close"], 14)
+        df["ema_50"] = self._ema(df["close"], 50)
+
+        h, l, c = df["high"], df["low"], df["close"]
+        tr = pd.concat([
+            h - l,
+            (h - c.shift()).abs(),
+            (l - c.shift()).abs(),
+        ], axis=1).max(axis=1)
+        df["atr_14"] = tr.ewm(span=14, adjust=False).mean()
+        df["bb_mid"] = df["close"].rolling(20).mean()
+        df["bb_std"] = df["close"].rolling(20).std(ddof=0)
+        df["zscore"] = (df["close"] - df["bb_mid"]) / df["bb_std"].replace(0, pd.NA)
+        df["vol_sma_20"] = df["volume"].rolling(20).mean()
+        df["vwap_20"] = (
+            (df["close"] * df["volume"]).rolling(20).sum() /
+            df["volume"].rolling(20).sum().replace(0, pd.NA)
+        )
+        df["breakout_20"] = df["high"].rolling(20).max()
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        vol_sma = float(latest.get("vol_sma_20", 0) or 0)
+        volume_ratio = (float(latest["volume"]) / vol_sma) if vol_sma > 0 else 1.0
+        zscore_val = latest.get("zscore", 0)
+        if pd.isna(zscore_val):
+            zscore_val = 0.0
+        vwap_val = latest.get("vwap_20", latest["close"])
+        if pd.isna(vwap_val):
+            vwap_val = latest["close"]
+        orb_high = latest.get("breakout_20", latest["high"])
+        if pd.isna(orb_high):
+            orb_high = latest["high"]
+        benchmark_symbol = str(getattr(self.config.trading, "swing_benchmark_symbol", "XLK")).upper()
+        return_20 = (
+            (float(df["close"].iloc[-1]) / float(df["close"].iloc[-21])) - 1.0
+            if len(df) >= 21 and float(df["close"].iloc[-21]) > 0 else 0.0
+        )
+        return_60 = (
+            (float(df["close"].iloc[-1]) / float(df["close"].iloc[-61])) - 1.0
+            if len(df) >= 61 and float(df["close"].iloc[-61]) > 0 else 0.0
+        )
+
+        return {
+            "price": float(latest["close"]),
+            "macd": float(latest.get("macd", 0)),
+            "macd_signal": float(latest.get("macd_signal", 0)),
+            "rsi": float(latest.get("rsi", 50)),
+            "ema_50": float(latest.get("ema_50", 0)),
+            "atr_14": float(latest.get("atr_14", 0)),
+            "vwap": float(vwap_val),
+            "zscore": float(zscore_val),
+            "volume_ratio": volume_ratio,
+            "opening_range_high": float(orb_high),
+            "opening_range_low": float(latest.get("low", 0)),
+            "ema_20": float(latest.get("ema_20", latest["close"])),
+            "ema_20_prev": float(prev.get("ema_20", latest.get("ema_20", latest["close"]))),
+            "return_20": return_20,
+            "return_60": return_60,
+            "benchmark_return_20": self._recent_benchmark_return(benchmark_symbol, "daily", 20),
+            "benchmark_return_60": self._recent_benchmark_return(benchmark_symbol, "daily", 60),
+        }
+
+    def _compute_symbol_indicators(self, ticker: str) -> dict | None:
+        try:
+            if self._is_swing_style():
+                return self._compute_swing_indicators(ticker)
+            return self._compute_intraday_indicators(ticker)
+        except Exception as exc:
+            self.logger.error(f"{ticker} indicator error: {exc}")
+            return None
+
+    def _trade_count_this_week(self, now: datetime) -> int:
+        week_start = (now - timedelta(days=now.weekday())).date()
+        return sum(1 for ts in self._entry_timestamps if ts.date() >= week_start)
+
+    def _symbol_on_cooldown(self, ticker: str, now: datetime) -> bool:
+        cfg = self.config.trading
+        min_gap = int(getattr(cfg, "min_days_between_trades", 0))
+        symbol_cooldown = int(getattr(cfg, "symbol_cooldown_days", 0))
+        last_exit = self._last_exit_time.get(ticker)
+        if not last_exit:
+            return False
+        elapsed_days = (now.date() - last_exit.date()).days
+        return elapsed_days < min_gap or elapsed_days < symbol_cooldown
+
+    def _can_open_new_entry(self, ticker: str, now: datetime) -> tuple[bool, str]:
+        cfg = self.config.trading
+        max_daily_entries = int(getattr(cfg, "max_new_entries_per_day", 2))
+        entries_today = self._daily_entry_counts.get(now.date(), 0)
+        if entries_today >= max_daily_entries:
+            return False, f"daily_entry_cap({entries_today}/{max_daily_entries})"
+
+        min_gap_hours = int(getattr(cfg, "min_hours_between_symbol_entries", 4))
+        if min_gap_hours > 0:
+            last_entry = self._last_entry_time.get(ticker)
+            if last_entry and now - last_entry < timedelta(hours=min_gap_hours):
+                return False, f"recent_entry_gap<{min_gap_hours}h"
+
+        reentry_gap_hours = int(getattr(cfg, "reentry_cooldown_after_exit_hours", 6))
+        if reentry_gap_hours > 0:
+            last_exit = self._last_exit_time.get(ticker)
+            if last_exit and now - last_exit < timedelta(hours=reentry_gap_hours):
+                return False, f"recent_exit_gap<{reentry_gap_hours}h"
+
+        return True, ""
+
+    def _compute_portfolio_signal(self, ticker: str, ind: dict) -> tuple[float, str]:
+        price        = ind["price"]
+        macd         = ind["macd"]
+        macd_sig     = ind["macd_signal"]
+        rsi_val      = ind["rsi"]
+        ema_val      = ind["ema_50"]
+        vwap         = ind["vwap"]
+        volume_ratio = ind["volume_ratio"]
+        orb_high     = ind["opening_range_high"]
+        close_location = float(ind.get("close_location", 0.5))
+
+        sentiment_raw = self._feeds.get_sentiment(ticker)
+        ob_imbalance  = self._feeds.get_ob_imbalance(ticker)
+
+        component_scores: dict[str, float] = {
+            "momentum": 0.0, "mean_reversion": 0.0, "orb": 0.0,
+            "vwap_twap": 0.0, "market_making": 0.0, "stat_arb": 0.0, "sentiment": 0.0,
+        }
+
+        cfg = self.config.trading
+        if self._is_swing_style():
+            ema_20 = float(ind.get("ema_20", price))
+            ema_20_prev = float(ind.get("ema_20_prev", ema_20))
+            rel_20 = float(ind.get("return_20", 0.0)) - float(ind.get("benchmark_return_20", 0.0))
+            rel_60 = float(ind.get("return_60", 0.0)) - float(ind.get("benchmark_return_60", 0.0))
+            max_extension = float(getattr(cfg, "swing_max_ema20_extension_pct", 0.06))
+            min_rel_20 = float(getattr(cfg, "swing_min_relative_strength_20d", 0.01))
+            min_rel_60 = float(getattr(cfg, "swing_min_relative_strength_60d", 0.0))
+            min_volume = float(getattr(cfg, "swing_min_volume_ratio", 0.9))
+            extension = (price / max(ema_20, 1e-9)) - 1.0
+
+            if not (
+                price > ema_20 > ema_val
+                and ema_20 > ema_20_prev
+                and macd > macd_sig
+                and 45 <= rsi_val <= 68
+                and -0.01 <= extension <= max_extension
+                and rel_20 >= min_rel_20
+                and rel_60 >= min_rel_60
+                and volume_ratio >= min_volume
+            ):
+                return 0.0, (
+                    f"swing_filter_fail(rel20={rel_20:.2%}, rel60={rel_60:.2%}, "
+                    f"ext={extension:.2%}, rsi={rsi_val:.1f})"
+                )
+
+            rel_score = min(1.0, max(0.0, rel_20 / 0.08))
+            trend_score = min(1.0, max(0.0, (price / max(ema_val, 1e-9) - 1.0) / 0.12))
+            pullback_score = max(0.0, 1.0 - max(0.0, extension) / max(max_extension, 1e-9))
+            volume_score = min(1.0, max(0.0, (volume_ratio - min_volume) / 0.8))
+            score = (
+                0.40 * rel_score
+                + 0.25 * trend_score
+                + 0.25 * pullback_score
+                + 0.10 * volume_score
+            )
+            return score, (
+                f"swing_rel_xlk:{rel_score:.2f}, trend:{trend_score:.2f}, "
+                f"pullback:{pullback_score:.2f}, rel20={rel_20:.2%}"
+            )
+
+        # RSI window: healthy momentum zone, not overbought (config: 55-72)
+        momentum_rsi_min = float(getattr(cfg, "momentum_rsi_min", 55))
+        momentum_rsi_max = float(getattr(cfg, "momentum_rsi_max", 72))
+        orb_min_volume_ratio = float(getattr(cfg, "orb_min_volume_ratio", 1.05))
+        sentiment_min_score = float(getattr(cfg, "sentiment_min_score", 0.05))
+        order_imbalance_min = float(getattr(cfg, "order_imbalance_min", 0.05))
+        min_relative_strength = float(
+            getattr(cfg, "intraday_min_relative_strength_pct", 0.0015)
+        )
+        max_vwap_distance = float(getattr(cfg, "intraday_max_vwap_distance_pct", 0.018))
+        min_volume_ratio = float(getattr(cfg, "intraday_min_volume_ratio", 1.05))
+        max_close_location = float(getattr(cfg, "intraday_max_close_location", 0.72))
+        require_vwap_component = bool(getattr(cfg, "intraday_require_vwap_component", True))
+        relative_strength = float(ind.get("daily_return_1", 0.0)) - float(
+            ind.get("benchmark_return_1", 0.0)
+        )
+
+        # Percentage-based gaps — scale-consistent between daily and hourly bars
+        volume_support  = min(1.0, max(0.0, (volume_ratio - 0.8) / 0.8))
+        trend_gap_pct   = max(0.0, (macd - macd_sig) / max(price, 1e-9))   # MACD gap as % of price
+        ema_gap         = max(0.0, (price / max(ema_val, 1e-9)) - 1.0)     # % above EMA50
+        vwap_dist       = (price / max(vwap, 1e-9)) - 1.0                  # signed % from VWAP
+
+        # ── MOMENTUM: confirmed trend, stock not extremely overbought ──
+        # Removed: daily_return_1 >= 0.005 (chasing) and close_location >= 0.60 (chasing).
+        # RSI 55-72: healthy momentum zone, not overbought.
+        # VWAP proximity removed from momentum gate — RSI is the overbought guard;
+        # proximity is rewarded through the vwap_twap component score.
+        if (
+            price > ema_val
+            and macd > macd_sig
+            and momentum_rsi_min <= rsi_val <= momentum_rsi_max
+            and volume_ratio >= min_volume_ratio
+            and relative_strength >= min_relative_strength
+            and close_location <= max_close_location
+        ):
+            component_scores["momentum"] = min(
+                1.0,
+                (0.45 * math.tanh(trend_gap_pct * 800.0))   # normalised by price
+                + (0.35 * math.tanh(ema_gap * 15.0))         # meaningful for 1-5% gaps
+                + (0.20 * volume_support),
+            )
+
+        # ── VWAP/TWAP: trend-direction + proximity confirmation ──────
+        # Gate: price above session VWAP (bullish side) with MACD confirming.
+        # Score rewards proximity (closer to VWAP = tighter stop = better R:R).
+        # 3.5% is appropriate for intraday same-session VWAP.
+        if (
+            price > vwap
+            and macd > macd_sig
+            and rsi_val >= 50
+            and volume_ratio >= min_volume_ratio
+            and relative_strength >= min_relative_strength
+            and 0 <= vwap_dist <= max_vwap_distance
+            and close_location <= max_close_location
+        ):
+            proximity_bonus = max(0.0, 1.0 - (vwap_dist / max(max_vwap_distance, 1e-9)))
+            component_scores["vwap_twap"] = min(
+                1.0,
+                (0.55 * proximity_bonus)
+                + (0.25 * math.tanh(trend_gap_pct * 600.0))
+                + (0.20 * volume_support),
+            )
+
+        # ── ORB: genuine breakout above opening range ──────────────────
+        if price > orb_high * 1.001 and volume_ratio >= orb_min_volume_ratio:
+            breakout_pct = (price / max(orb_high, 1e-9)) - 1.0
+            component_scores["orb"] = min(1.0, 0.5 + math.tanh(breakout_pct * 30.0))
+
+        if require_vwap_component and component_scores["vwap_twap"] <= 0:
+            return 0.0, (
+                f"await_vwap_pullback(vwap_dist={vwap_dist:.2%}, "
+                f"bar_loc={close_location:.2f}, rel_qqq={relative_strength:.2%})"
+            )
+
+        # ── COMPOUND CONFIRMATION GATE ─────────────────────────────────
+        # Require at least 2 components to fire. Single-signal entries are noise.
+        active_count = sum(
+            1 for k, s in component_scores.items()
+            if s > 0 and self._strategy_weights.get(k, 0) > 0
+        )
+        if active_count < 2:
+            return 0.0, "insufficient_confirmation"
+
+        if sentiment_raw > sentiment_min_score:
+            component_scores["sentiment"] = min(
+                1.0,
+                (sentiment_raw - sentiment_min_score) / max(1e-9, 1 - sentiment_min_score),
+            )
+
+        if ob_imbalance > order_imbalance_min:
+            component_scores["market_making"] = min(
+                1.0,
+                (ob_imbalance - order_imbalance_min) / max(1e-9, 1 - order_imbalance_min),
+            )
+
+        weighted = 0.0
+        active: list[str] = []
+        for name, score in component_scores.items():
+            weight = self._strategy_weights.get(name, 0.0)
+            if score > 0 and weight > 0:
+                active.append(f"{name}:{score:.2f}")
+            weighted += weight * score
+
+        reason = ", ".join(active) if active else "none"
+        if active:
+            reason = f"{reason}, rel_qqq={relative_strength:.2%}"
+        return weighted, reason
+
+    def _compute_bearish_portfolio_signal(self, ticker: str, ind: dict) -> tuple[float, str]:
+        price = ind["price"]
+        macd = ind["macd"]
+        macd_sig = ind["macd_signal"]
+        rsi_val = ind["rsi"]
+        ema_val = ind["ema_50"]
+        vwap = ind["vwap"]
+        volume_ratio = ind["volume_ratio"]
+        orb_low = ind["opening_range_low"]
+        close_location = float(ind.get("close_location", 0.5))
+
+        cfg = self.config.trading
+        # Relaxed bear RSI range: [25, 55] vs prior [28, 48]
+        bear_rsi_min = float(getattr(cfg, "bear_rsi_min", 25))
+        bear_rsi_max = float(getattr(cfg, "bear_rsi_max", 55))
+        bear_orb_min_volume_ratio = float(getattr(cfg, "bear_orb_min_volume_ratio", 1.05))
+
+        volume_support  = min(1.0, max(0.0, (volume_ratio - 0.8) / 0.8))
+        trend_gap_pct   = max(0.0, (macd_sig - macd) / max(price, 1e-9))    # bearish gap as % of price
+        ema_gap         = max(0.0, (ema_val / max(price, 1e-9)) - 1.0)      # % below EMA50
+        vwap_dist_below = max(0.0, (vwap / max(price, 1e-9)) - 1.0)         # % below VWAP
+
+        component_scores: dict[str, float] = {
+            "momentum": 0.0, "mean_reversion": 0.0, "orb": 0.0,
+            "vwap_twap": 0.0, "market_making": 0.0, "stat_arb": 0.0, "sentiment": 0.0,
+        }
+
+        # ── BEAR MOMENTUM: confirmed downtrend, not in extreme oversold ──
+        # Removed: daily_return_1 <= -0.005 and close_location <= 0.40 (chasing filters).
+        # RSI [25, 55]: confirmed selling pressure but not extreme oversold (bounce risk).
+        if (
+            price < ema_val
+            and macd < macd_sig
+            and bear_rsi_min <= rsi_val <= bear_rsi_max
+            and volume_ratio >= 1.0
+            and close_location >= 0.18               # not short-selling at extreme bottom of bar
+        ):
+            component_scores["momentum"] = min(
+                1.0,
+                (0.45 * math.tanh(trend_gap_pct * 800.0))
+                + (0.35 * math.tanh(ema_gap * 15.0))
+                + (0.20 * volume_support),
+            )
+
+        # ── BEAR VWAP: trend-direction + proximity short confirmation ──
+        # Score rewards proximity to VWAP from below over 3.5% range (intraday scale).
+        if (
+            price < vwap
+            and macd < macd_sig
+            and rsi_val <= 52
+            and volume_ratio >= 0.85
+            and vwap_dist_below <= 0.035             # within 3.5% below session VWAP
+        ):
+            proximity_bonus = max(0.0, 1.0 - (vwap_dist_below / 0.035))
+            component_scores["vwap_twap"] = min(
+                1.0,
+                (0.55 * proximity_bonus)
+                + (0.25 * math.tanh(trend_gap_pct * 600.0))
+                + (0.20 * volume_support),
+            )
+
+        # ── BEAR ORB: breakdown below opening range ────────────────────
+        if price < orb_low * 0.999 and volume_ratio >= bear_orb_min_volume_ratio:
+            breakdown_pct = (max(orb_low, 1e-9) / price) - 1.0
+            component_scores["orb"] = min(1.0, 0.5 + math.tanh(breakdown_pct * 30.0))
+
+        # ── COMPOUND CONFIRMATION GATE ─────────────────────────────────
+        active_count = sum(
+            1 for k, s in component_scores.items()
+            if s > 0 and self._strategy_weights.get(k, 0) > 0
+        )
+        if active_count < 2:
+            return 0.0, "insufficient_bear_confirmation"
+
+        weighted = 0.0
+        active: list[str] = []
+        for name, score in component_scores.items():
+            weight = self._strategy_weights.get(name, 0.0)
+            if score > 0 and weight > 0:
+                active.append(f"bear_{name}:{score:.2f}")
+            weighted += weight * score
+
+        return weighted, ", ".join(active) if active else "none"
+
+    # ================================================================
+    #  MARKET REGIME DETECTION
+    # ================================================================
+    def detect_market_regime(self):
+        try:
+            if not self._is_market_open():
+                self._log_market_closed_skip("detect_market_regime")
+                return
+
+            spy = self._compute_spy_indicators()
+            if not spy:
+                self.logger.warning("Cannot compute SPY indicators — keeping regime")
+                return
+
+            ema_20, ema_50 = spy["ema_20"], spy["ema_50"]
+            ema_20_prev    = spy["ema_20_prev"]
+            spy_price      = spy["price"]
+            rsi_val        = spy["rsi"]
+
+            previous_regime    = self.market_regime
+            price_above_50     = spy_price > ema_50
+            price_below_50     = spy_price < ema_50
+            ema_structure_bull = ema_20 > ema_50
+            ema_structure_bear = ema_20 < ema_50
+            ema_20_rising      = ema_20 > ema_20_prev
+            momentum_bear      = (not ema_20_rising) and spy_price < ema_20
+
+            if price_above_50 and ema_structure_bull:
+                self.market_regime = "BULL"
+            elif price_below_50 and ema_structure_bear and momentum_bear:
+                self.market_regime = "BEAR"
+            else:
+                if previous_regime == "BULL" and price_above_50:
+                    self.market_regime = "BULL"
+                elif previous_regime == "BEAR" and price_below_50:
+                    self.market_regime = "BEAR"
+                else:
+                    self.market_regime = "NEUTRAL"
+
+            rsi_str = f" | RSI: {rsi_val:.1f}" if rsi_val else ""
+            self.logger.info(
+                f"Regime: {self.market_regime} | SPY: {spy_price:.2f} "
+                f"| EMA20: {ema_20:.2f} | EMA50: {ema_50:.2f} "
+                f"| Rising: {ema_20_rising}{rsi_str}"
+            )
+
+            if previous_regime != self.market_regime:
+                self.logger.warning(f"REGIME CHANGE: {previous_regime} → {self.market_regime}")
+                self._send_alert_email(
+                    f"Regime Change: {previous_regime} → {self.market_regime}",
+                    f"SPY: {spy_price:.2f} | EMA20: {ema_20:.2f} | EMA50: {ema_50:.2f}",
+                )
+
+        except Exception as exc:
+            self.logger.error(f"Regime detection error: {exc}")
+
+    # ================================================================
+    #  MARKET HOURS CHECK
+    # ================================================================
+    def _is_market_open(self) -> bool:
+        try:
+            et      = pytz.timezone("US/Eastern")
+            now_et  = datetime.now(et)
+            return (now_et.weekday() < 5
+                    and dt_time(9, 30) <= now_et.time() <= dt_time(16, 0))
+        except Exception:
+            return True
+
+    def _roll_schedule_stats_day(self):
+        try:
+            today_et = datetime.now(pytz.timezone("US/Eastern")).date()
+            if today_et != self._schedule_stats_date:
+                self._schedule_stats_date          = today_et
+                self._schedule_trigger_count       = 0
+                self._schedule_market_closed_skips = 0
+                self._last_closed_log_key.clear()
+        except Exception:
+            pass
+
+    def _log_market_closed_skip(self, job_name: str):
+        try:
+            self._roll_schedule_stats_day()
+            et      = pytz.timezone("US/Eastern")
+            now_et  = datetime.now(et)
+            key     = f"{now_et.strftime('%Y-%m-%d %H:%M')}|{job_name}"
+            if self._last_closed_log_key.get(job_name) == key:
+                return
+            self._last_closed_log_key[job_name] = key
+            self._schedule_market_closed_skips += 1
+            self.logger.info(f"Market closed - skipping {job_name}")
+        except Exception:
+            self.logger.info(f"Market closed - skipping {job_name}")
+
+    # ================================================================
+    #  POSITION SIZING
+    # ================================================================
+    def _calculate_position_size(self, ticker: str, price: float) -> int:
+        try:
+            risk = self.config.risk
+            available_cash = self.cash
+            min_notional = float(getattr(risk, "min_entry_notional", 2500))
+            max_position_pct = float(getattr(risk, "max_position_size_pct", 0.25))
+            max_position_value = float(getattr(risk, "max_position_value", 6500))
+            target_value = min(available_cash * max_position_pct, max_position_value)
+            if target_value < min_notional:
+                return 0
+            qty = int(target_value / price)
+            if qty <= 0:
+                return 0
+            # Alpaca is commission-free; keep fee estimate for minimum-size check
+            fee        = self._estimate_fee(qty, price)
+            total_cost = qty * price + fee
+            if total_cost > target_value:
+                qty        = int((target_value - fee) / price)
+                total_cost = qty * price + self._estimate_fee(qty, price)
+            return qty if qty > 0 and total_cost >= min_notional else 0
+        except Exception as exc:
+            self.logger.error(f"Position sizing error: {exc}")
+            return 0
+
+    @staticmethod
+    def _estimate_fee(qty: int, price: float) -> float:
+        """Alpaca is commission-free; this is a negligible SEC fee floor."""
+        if qty <= 0 or price <= 0:
+            return 0.0
+        trade_value = qty * price
+        return min(0.000008 * trade_value, 0.35)
+
+    # ================================================================
+    #  ORDER EXECUTION
+    # ================================================================
+    def _wait_for_fill(self, order_id: str, timeout: int = 30) -> object:
+        """Poll order status until filled or timeout."""
+        for _ in range(timeout):
+            time.sleep(1)
+            try:
+                order = self.trading_client.get_order_by_id(order_id)
+                if order.status in (
+                    AlpacaOrderStatus.FILLED,
+                    AlpacaOrderStatus.CANCELED,
+                    AlpacaOrderStatus.EXPIRED,
+                    AlpacaOrderStatus.REJECTED,
+                ):
+                    return order
+            except Exception:
+                pass
+        return self.trading_client.get_order_by_id(order_id)
+
+    def _place_market_buy(self, ticker: str, qty: int) -> bool:
+        try:
+            req = MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = self.trading_client.submit_order(req)
+            self.logger.info(f"ORDER PLACED: BUY {qty} {ticker}")
+            final = self._wait_for_fill(str(order.id))
+            if final.status == AlpacaOrderStatus.FILLED:
+                fill_price = float(final.filled_avg_price or 0)
+                self.logger.info(f"FILLED: BUY {qty} {ticker} @ ${fill_price:.2f}")
+                return True
+            self.logger.warning(f"BUY order status: {final.status}")
+            return final.status in (AlpacaOrderStatus.FILLED,)
+        except Exception as exc:
+            self.logger.error(f"Buy order error {ticker}: {exc}")
+            return False
+
+    def _place_market_sell(self, ticker: str, qty: int, reason: str = "") -> bool:
+        try:
+            req = MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = self.trading_client.submit_order(req)
+            self.logger.info(f"ORDER PLACED: SELL {qty} {ticker} ({reason})")
+            final = self._wait_for_fill(str(order.id))
+            if final.status == AlpacaOrderStatus.FILLED:
+                fill_price = float(final.filled_avg_price or 0)
+                self.logger.info(f"FILLED: SELL {qty} {ticker} @ ${fill_price:.2f} ({reason})")
+                return True
+            self.logger.warning(f"SELL order status: {final.status}")
+            return False
+        except Exception as exc:
+            self.logger.error(f"Sell order error {ticker}: {exc}")
+            return False
+
+    # ================================================================
+    #  SIGNAL EVALUATION (entry + exit)
+    # ================================================================
+    def flatten_intraday_positions(self):
+        if not self._style_settings["flatten_eod"]:
+            return
+        if not self._is_market_open():
+            self._log_market_closed_skip("flatten_intraday_positions")
+            return
+        positions = self._get_positions()
+        for ticker in list(self._algo_managed_positions):
+            pos = positions.get(ticker)
+            if not pos:
+                continue
+            qty = int(pos.get("qty", 0))
+            if qty <= 0:
+                continue
+            side = str(pos.get("side", "LONG")).upper()
+            closed = (
+                self._place_market_sell(ticker, qty, "eod_flatten")
+                if side == "LONG"
+                else self._place_market_buy(ticker, qty)
+            )
+            if closed:
+                self._algo_managed_positions.discard(ticker)
+                self._entry_strategy_reason.pop(ticker, None)
+                self._entry_side.pop(ticker, None)
+                self._last_exit_time[ticker] = datetime.now()
+                self._save_state()
+                action = "SELL" if side == "LONG" else "BUY_TO_COVER"
+                self.logger.info(f"EOD FLATTEN: {action} {ticker} qty={qty}")
+
+    def evaluate_signals(self):
+        try:
+            if self._is_tech_momentum_strategy():
+                self.check_tech_momentum_trailing_stops()
+                return
+            if not self._is_market_open():
+                self._log_market_closed_skip("evaluate_signals")
+                return
+            if not self._trading_enabled:
+                self.logger.warning("Trading disabled (circuit breaker)")
+                return
+
+            current_equity = self.net_liquidation
+            if current_equity <= 0:
+                return
+
+            self._roll_daily_risk_baseline(current_equity)
+
+            daily_loss = self._session_start_equity - current_equity
+            if daily_loss > self._style_settings["max_daily_loss"]:
+                self.logger.critical(f"DAILY LOSS LIMIT: ${daily_loss:,.2f}")
+                self._trading_enabled = False
+                self._send_alert_email(
+                    "CIRCUIT BREAKER: Daily Loss Limit",
+                    f"Loss: ${daily_loss:,.2f} exceeds ${self._style_settings['max_daily_loss']}",
+                )
+                return
+
+            if current_equity > self.peak_equity:
+                self.peak_equity = current_equity
+
+            drawdown = ((self.peak_equity - current_equity) / self.peak_equity
+                        if self.peak_equity > 0 else 0)
+            if drawdown > self.config.risk.max_drawdown_pct:
+                self.logger.critical(f"DRAWDOWN LIMIT: {drawdown:.1%}")
+                self._trading_enabled = False
+                self._send_alert_email(
+                    "CIRCUIT BREAKER: Max Drawdown",
+                    f"Drawdown: {drawdown:.1%} > {self.config.risk.max_drawdown_pct:.1%}",
+                )
+                return
+
+            self._evaluate_exits_and_entries(current_equity)
+
+        except Exception as exc:
+            self.logger.error(f"Signal evaluation error: {exc}")
+
+    def _evaluate_exits_and_entries(self, current_equity: float):
+        now       = datetime.now()
+        positions = self._get_positions()
+
+        algo_positions = {
+            t: p for t, p in positions.items() if t in self._algo_managed_positions
+        }
+
+        # ── EXIT LOGIC ─────────────────────────────────────────────
+        for ticker in list(algo_positions):
+            pos = positions.get(ticker)
+            if not pos:
+                continue
+            try:
+                current_price = pos["market_price"]
+                if current_price <= 0:
+                    current_price = self._get_price(ticker)
+                if current_price <= 0:
+                    continue
+
+                avg_entry  = pos["avg_cost"]
+                qty        = int(pos["qty"])
+                side       = str(pos.get("side", "LONG")).upper()
+                direction  = 1 if side == "LONG" else -1
+                pnl_pct    = (direction * (current_price - avg_entry) / avg_entry) if avg_entry > 0 else 0
+                pnl_dollar = direction * qty * (current_price - avg_entry)
+                held_time  = now - self.entry_time.get(ticker, now)
+
+                if side == "LONG":
+                    self.highest_price[ticker] = max(
+                        self.highest_price.get(ticker, current_price), current_price
+                    )
+                else:
+                    self.highest_price[ticker] = min(
+                        self.highest_price.get(ticker, current_price), current_price
+                    )
+
+                should_exit, reason = False, ""
+                style = self._style_settings
+
+                if pnl_pct <= -style["stop_loss_pct"]:
+                    should_exit, reason = True, "stop_loss"
+                elif held_time >= timedelta(hours=style["min_hold_hours"]) and pnl_pct >= style["take_profit_pct"]:
+                    should_exit, reason = True, "take_profit"
+                elif (held_time >= timedelta(hours=style["profit_lock_hours"])
+                      and pnl_pct >= style["profit_lock_min_gain_pct"]):
+                    should_exit, reason = True, "profit_lock"
+                elif held_time >= timedelta(days=style["max_hold_days"]):
+                    should_exit, reason = True, "time_exit"
+
+                if side == "LONG":
+                    trail_activation = avg_entry * (1 + style["trailing_activation_pct"])
+                    trailing_stop = self.highest_price.get(ticker, current_price) * (1 - style["trailing_stop_pct"])
+                    if self.highest_price.get(ticker, current_price) >= trail_activation and current_price <= trailing_stop:
+                        should_exit, reason = True, "trailing_stop"
+                else:
+                    trail_activation = avg_entry * (1 - style["trailing_activation_pct"])
+                    trailing_stop = self.highest_price.get(ticker, current_price) * (1 + style["trailing_stop_pct"])
+                    if self.highest_price.get(ticker, current_price) <= trail_activation and current_price >= trailing_stop:
+                        should_exit, reason = True, "trailing_stop"
+
+                if pnl_pct <= -0.05:
+                    self.logger.critical(f"GAP DOWN: {ticker} at {pnl_pct:.2%}")
+                    should_exit, reason = True, "gap_protection"
+
+                # ── SIGNAL-REVERSAL EXIT ───────────────────────────────────
+                # If the trend signal (MACD) that triggered entry has reversed
+                # while we're in profit, exit now rather than waiting for stop/time.
+                if not should_exit and pnl_pct >= 0.003:
+                    live_ind = self._compute_symbol_indicators(ticker)
+                    if live_ind:
+                        if side == "LONG" and live_ind["macd"] < live_ind["macd_signal"]:
+                            should_exit, reason = True, "signal_reversal"
+                        elif side == "SHORT" and live_ind["macd"] > live_ind["macd_signal"]:
+                            should_exit, reason = True, "signal_reversal"
+
+                if should_exit:
+                    closed = (
+                        self._place_market_sell(ticker, qty, reason)
+                        if side == "LONG"
+                        else self._place_market_buy(ticker, qty)
+                    )
+                    if closed:
+                        exit_action = "SELL" if side == "LONG" else "BUY_TO_COVER"
+                        record = (
+                            f"{now.strftime('%Y-%m-%d %H:%M')} {exit_action} {ticker} "
+                            f"- Qty: {qty} @ ${current_price:.2f} | P&L: ${pnl_dollar:.2f}"
+                        )
+                        self.trade_history.append(record)
+                        if pnl_dollar > 0:
+                            self.winning_trades.append(record)
+                        else:
+                            self.losing_trades.append(record)
+                        self._update_symbol_performance(ticker, pnl_dollar)
+                        self._algo_managed_positions.discard(ticker)
+                        self._entry_strategy_reason.pop(ticker, None)
+                        self._entry_side.pop(ticker, None)
+                        self._last_exit_time[ticker] = now
+                        self._save_state()
+                        self.logger.info(f"EXIT {ticker}: {reason}, P&L ${pnl_dollar:.0f}")
+
+            except Exception as exc:
+                self.logger.error(f"Exit error for {ticker}: {exc}")
+
+        # ── ENTRY LOGIC ────────────────────────────────────────────
+        allow_bear_entries = bool(getattr(self.config.trading, "bear_entry_enabled", False))
+        if self.market_regime == "BEAR" and not allow_bear_entries:
+            self.logger.info("Entry scan skipped: BEAR regime configured as risk-off")
+            return
+
+        portfolio_return = (
+            (current_equity - self._starting_cash) / self._starting_cash
+            if self._starting_cash > 0 else 0
+        )
+
+        max_positions = self.config.trading.max_positions
+        if self.market_regime == "BULL" and portfolio_return > 0.02:
+            max_allowed = max_positions
+        elif self.market_regime == "BULL":
+            max_allowed = min(3, max_positions)
+        elif self.market_regime == "NEUTRAL":
+            max_allowed = min(2, max_positions)
+        else:
+            max_allowed = 1
+
+        algo_count = len([t for t in self._algo_managed_positions if t in positions])
+        if algo_count >= max_allowed:
+            return
+
+        min_notional = float(getattr(self.config.risk, "min_entry_notional", 2500))
+        if self.cash < min_notional:
+            self.logger.info(
+                f"Entry scan skipped: cash ${self.cash:,.2f} below min notional ${min_notional:,.2f}"
+            )
+            return
+
+        if self._is_swing_style() and self._trade_count_this_week(now) >= self.config.trading.max_weekly_trades:
+            self.logger.info("Weekly trade cap reached - skipping new swing entries")
+            return
+
+        candidates: list[tuple[str, float, float, str]] = []
+        near_miss: tuple[str, float, str] | None = None
+        required_score = self._entry_score_threshold()
+        for ticker in self._active_universe:
+            if ticker == "SPY" or ticker in positions:
+                continue
+            if self._is_swing_style() and self._symbol_on_cooldown(ticker, now):
+                continue
+            allowed, block_reason = self._can_open_new_entry(ticker, now)
+            if not allowed:
+                continue
+
+            indicators = self._compute_symbol_indicators(ticker)
+            if not indicators:
+                continue
+
+            price = indicators["price"]
+            if price <= 0:
+                continue
+
+            if self.market_regime == "BEAR":
+                score, reason = self._compute_bearish_portfolio_signal(ticker, indicators)
+            else:
+                score, reason = self._compute_portfolio_signal(ticker, indicators)
+            if score >= required_score:
+                candidates.append((ticker, score, price, reason))
+            elif near_miss is None or score > near_miss[1]:
+                near_miss = (ticker, score, reason)
+
+            time.sleep(0.3)   # Alpaca rate-limit pacing
+
+        if not candidates:
+            if near_miss:
+                self.logger.info(
+                    f"No entries qualified. Best near miss: {near_miss[0]} score={near_miss[1]:.2f} "
+                    f"vs threshold {required_score:.2f} ({near_miss[2]})"
+                )
+            else:
+                self.logger.info("No entries qualified. No symbol produced a usable signal.")
+            return
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_ticker, best_score, current_price, reason = candidates[0]
+
+        live_price = self._get_price(best_ticker)
+        if live_price > 0:
+            current_price = live_price
+
+        qty = self._calculate_position_size(best_ticker, current_price)
+        if qty <= 0:
+            self.logger.info(
+                f"Entry rejected after sizing for {best_ticker}: cash ${self.cash:,.2f}, price ${current_price:.2f}"
+            )
+            return
+
+        opened = (
+            self._place_market_sell(best_ticker, qty, "short_entry")
+            if self.market_regime == "BEAR"
+            else self._place_market_buy(best_ticker, qty)
+        )
+        if opened:
+            self._algo_managed_positions.add(best_ticker)
+            self.entry_time[best_ticker]              = now
+            self.entry_price[best_ticker]             = current_price
+            self.highest_price[best_ticker]           = current_price
+            self._entry_strategy_reason[best_ticker]  = reason
+            self._entry_timestamps.append(now)
+            self._last_entry_time[best_ticker] = now
+            self._entry_side[best_ticker] = "SHORT" if self.market_regime == "BEAR" else "LONG"
+            self._daily_entry_counts[now.date()] = self._daily_entry_counts.get(now.date(), 0) + 1
+            self._save_state()
+
+            entry_action = "SELL_SHORT" if self.market_regime == "BEAR" else "BUY"
+            record = (
+                f"{now.strftime('%Y-%m-%d %H:%M')} {entry_action} {best_ticker} "
+                f"- Qty: {qty} @ ${current_price:.2f} | score={best_score:.2f} | {reason}"
+            )
+            self.trade_history.append(record)
+            self.logger.info(
+                f"{entry_action} {best_ticker}: qty={qty}, ${current_price:.2f}, "
+                f"score={best_score:.2f}, {reason}"
+            )
+
+    def _update_symbol_performance(self, ticker: str, pnl: float):
+        perf = self.symbol_performance[ticker]
+        perf["trades"] += 1
+        perf["total_pnl"] += pnl
+        if pnl > 0:
+            perf["wins"] += 1
+            perf["consecutive_losses"] = 0
+        else:
+            perf["consecutive_losses"] += 1
+        perf["win_rate"] = (
+            perf["wins"] / perf["trades"] * 100 if perf["trades"] > 0 else 0
+        )
+
+    # ================================================================
+    #  DAILY RISK SUMMARY
+    # ================================================================
+    def daily_risk_summary(self):
+        if not self._is_market_open():
+            self._log_market_closed_skip("daily_risk_summary")
+            return
+        try:
+            equity = self.net_liquidation
+            pnl    = equity - self._starting_cash
+            ret    = pnl / self._starting_cash if self._starting_cash > 0 else 0
+            self.logger.info(f"Daily: ${equity:,.0f} ({ret:.2%})")
+            self._trading_enabled = True     # Reset circuit breaker at EOD
+            self._session_start_equity = equity
+            self._risk_day = datetime.now(pytz.timezone("US/Eastern")).date()
+        except Exception as exc:
+            self.logger.error(f"Daily summary error: {exc}")
+
+    # ================================================================
+    #  EMAIL
+    # ================================================================
+    def send_portfolio_summary_email(self):
+        if not self._is_market_open():
+            self._log_market_closed_skip("send_portfolio_summary_email")
+            return
+        try:
+            et = pytz.timezone("US/Eastern")
+            now_et = datetime.now(et)
+            self._roll_schedule_stats_day()
+            equity       = self.net_liquidation
+            cash_val     = self.cash
+            total_return = (equity - self._starting_cash) / self._starting_cash if self._starting_cash > 0 else 0
+            daily_pnl    = equity - self._starting_cash
+            positions    = self._get_positions()
+
+            pos_lines = []
+            for ticker, pos in positions.items():
+                price = pos["market_price"]
+                avg   = pos["avg_cost"]
+                qty   = int(pos["qty"])
+                if price <= 0:
+                    live_price = self._get_price(ticker)
+                    if live_price > 0:
+                        price = live_price
+                    else:
+                        # Prevent false -100% P&L when broker omits current_price.
+                        price = avg
+                side  = str(pos.get("side", "LONG")).upper()
+                direction = 1 if side == "LONG" else -1
+                pnl   = direction * qty * (price - avg)
+                pnl_pct = (direction * (price - avg) / avg) if avg > 0 else 0
+                tag   = "ALGO" if ticker in self._algo_managed_positions else "MANUAL"
+                entry_dt = self.entry_time.get(ticker)
+                if entry_dt is None:
+                    held_str = "N/A"
+                else:
+                    held_delta = now_et - entry_dt
+                    if held_delta.total_seconds() < 0:
+                        held_delta = timedelta(0)
+                    held_str = str(held_delta).split('.')[0]
+                pos_lines.append(
+                    f"  {ticker:<6} | Qty:{qty:<5} | Entry:${avg:<8.2f} | "
+                    f"Now:${price:<8.2f} | P&L:${pnl:<8.2f} ({pnl_pct:>6.2%}) | "
+                    f"{tag} | {held_str}"
+                )
+
+            body = (
+                f"{'=' * 70}\nPORTFOLIO SUMMARY\n{'=' * 70}\n\n"
+                f"Equity:        ${equity:,.2f}\n"
+                f"Total Return:  {total_return:.2%}\n"
+                f"Daily P&L:     ${daily_pnl:,.2f}\n"
+                f"Cash:          ${cash_val:,.2f}\n"
+                f"Regime:        {self.market_regime}\n"
+                f"Algo Positions: {len(self._algo_managed_positions)}/{self.config.trading.max_positions}\n\n"
+                f"POSITIONS\n{'-' * 70}\n"
+            )
+            if pos_lines:
+                body += "\n".join(pos_lines) + "\n"
+            else:
+                body += "  No open positions\n"
+
+            body += f"\nRECENT TRADES\n{'-' * 70}\n"
+            recent = list(self.trade_history)[-10:]
+            body += ("\n".join(f"  {t}" for t in recent) + "\n") if recent else "  No recent trades\n"
+
+            body += f"\n{'=' * 70}\nGenerated (US/Eastern): {now_et.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            self._send_email(f"Portfolio Summary - {now_et.strftime('%Y-%m-%d %H:%M')} ET", body)
+        except Exception as exc:
+            self.logger.error(f"Portfolio email error: {exc}")
+
+    def send_weekly_summary_email(self):
+        try:
+            now_et = datetime.now(pytz.timezone("US/Eastern"))
+            equity  = self.net_liquidation
+            total_return = (equity - self._starting_cash) / self._starting_cash if self._starting_cash > 0 else 0
+            drawdown = ((self.peak_equity - equity) / self.peak_equity if self.peak_equity > 0 else 0)
+            wins  = len(self.winning_trades)
+            losses = len(self.losing_trades)
+            total  = wins + losses
+            win_rate = (wins / total * 100) if total else 0
+
+            body = (
+                f"{'=' * 80}\nWEEKLY PORTFOLIO ANALYSIS\n{'=' * 80}\n\n"
+                f"Equity:      ${equity:,.2f}\n"
+                f"Return:      {total_return:.2%}\n"
+                f"Drawdown:    {drawdown:.2%}\n"
+                f"Win Rate:    {win_rate:.1f}% ({wins}/{total})\n"
+                f"Regime:      {self.market_regime}\n\n"
+                f"RECENT TRADES (last 15)\n{'-' * 80}\n"
+            )
+            for t in list(self.trade_history)[-15:]:
+                body += f"  {t}\n"
+            body += f"\n{'=' * 80}\nWeekly Report (US/Eastern): {now_et.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            self._send_email(f"Weekly Portfolio Summary - {now_et.strftime('%Y-%m-%d')} ET", body)
+        except Exception as exc:
+            self.logger.error(f"Weekly email error: {exc}")
+
+    def _send_email(self, subject: str, body: str):
+        try:
+            cfg = self.config.email
+            if not all([cfg.smtp_server, cfg.sender_email, cfg.sender_password]):
+                return
+            msg = MIMEMultipart()
+            msg["From"]    = cfg.sender_email
+            msg["To"]      = cfg.recipient_email
+            subject_tag = "[ALPACA BOT]"
+            normalized_subject = subject.strip()
+            if not normalized_subject.startswith(subject_tag):
+                normalized_subject = f"{subject_tag} {normalized_subject}"
+            msg["Subject"] = normalized_subject
+            msg["X-Bot-Name"] = "ALPACA BOT"
+            msg["X-Bot-System"] = "EnhancedtradingBOTAlpaca"
+            msg.attach(MIMEText(body, "plain"))
+            server = smtplib.SMTP(cfg.smtp_server, cfg.smtp_port)
+            server.starttls()
+            server.login(cfg.sender_email, cfg.sender_password)
+            server.sendmail(cfg.sender_email, cfg.recipient_email, msg.as_string())
+            server.quit()
+            self.logger.info(f"Email sent: {subject}")
+        except Exception as exc:
+            self.logger.error(f"Email send error: {exc}")
+
+    def _send_alert_email(self, subject: str, body: str):
+        self._send_email(f"[ALERT] {subject}", body)
+
+    # ================================================================
+    #  SCHEDULER SETUP
+    # ================================================================
+    def _setup_scheduler(self):
+        mf   = "mon-fri"
+        et   = pytz.timezone("US/Eastern")
+        if self._is_tech_momentum_strategy():
+            self.scheduler.add_job(
+                self._safe_run(self.rebalance_tech_momentum),
+                CronTrigger(hour=10, minute=0, day_of_week="mon", timezone=et),
+                id="tech_momentum_weekly_rebalance",
+                replace_existing=True,
+            )
+            self.scheduler.add_job(
+                self._safe_run(self.check_tech_momentum_trailing_stops),
+                CronTrigger(hour="10-15", minute="*/15", day_of_week=mf, timezone=et),
+                id="tech_momentum_trailing_stops",
+                replace_existing=True,
+            )
+            self.scheduler.add_job(
+                self._safe_run(self.send_weekly_summary_email),
+                CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=et),
+                id="weekly_summary",
+                replace_existing=True,
+            )
+            self.logger.info("Scheduled Tech Universe Momentum jobs (US/Eastern)")
+            return
+
+        jobs = [
+            (9,  20, self.refresh_dynamic_universe_if_due, "universe_refresh"),
+            (9,  25, self.detect_market_regime,            "regime_morning"),
+            (12,  0, self.detect_market_regime,            "regime_midday"),
+            (15,  0, self.detect_market_regime,            "regime_afternoon"),
+            (9,  35, self.send_portfolio_summary_email,    "email_morning"),
+            (12, 30, self.send_portfolio_summary_email,    "email_midday"),
+            (15, 30, self.send_portfolio_summary_email,    "email_afternoon"),
+            (16,  0, self.send_portfolio_summary_email,    "email_close"),
+            (16,  0, self.daily_risk_summary,              "daily_risk"),
+        ]
+
+        for hour, minute, func, job_id in jobs:
+            self.scheduler.add_job(
+                self._safe_run(func),
+                CronTrigger(hour=hour, minute=minute, day_of_week=mf, timezone=et),
+                id=job_id,
+                replace_existing=True,
+            )
+
+        if self._is_intraday_style():
+            self.scheduler.add_job(
+                self._safe_run(self.evaluate_signals),
+                CronTrigger(hour=9, minute="30,45", day_of_week=mf, timezone=et),
+                id="signals_intraday_open",
+                replace_existing=True,
+            )
+            self.scheduler.add_job(
+                self._safe_run(self.evaluate_signals),
+                CronTrigger(hour="10-15", minute="*/15", day_of_week=mf, timezone=et),
+                id="signals_intraday_loop",
+                replace_existing=True,
+            )
+            if self._style_settings["flatten_eod"]:
+                self.scheduler.add_job(
+                    self._safe_run(self.flatten_intraday_positions),
+                    CronTrigger(hour=15, minute=55, day_of_week=mf, timezone=et),
+                    id="flatten_eod",
+                    replace_existing=True,
+                )
+        else:
+            for hour, minute, job_id in [(10, 0, "signals_swing_open"), (15, 30, "signals_swing_close")]:
+                self.scheduler.add_job(
+                    self._safe_run(self.evaluate_signals),
+                    CronTrigger(hour=hour, minute=minute, day_of_week=mf, timezone=et),
+                    id=job_id,
+                    replace_existing=True,
+                )
+
+        self.scheduler.add_job(
+            self._safe_run(self.send_weekly_summary_email),
+            CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=et),
+            id="weekly_summary",
+            replace_existing=True,
+        )
+        self.logger.info(f"Scheduled {len(jobs) + 1} jobs (US/Eastern, Mon-Fri)")
+
+    def _safe_run(self, func):
+        def wrapper():
+            try:
+                self._roll_schedule_stats_day()
+                self._schedule_trigger_count += 1
+                self.logger.info(f"Scheduled job triggered: {func.__name__}")
+                func()
+            except Exception as exc:
+                self.logger.error(f"Job {func.__name__} error: {exc}")
+        wrapper.__name__ = func.__name__
+        return wrapper
+
+    # ================================================================
+    #  SIGNAL HANDLERS + MAIN ENTRY POINT
+    # ================================================================
+    def _signal_handler(self, signum, frame):
+        self.logger.info(f"Signal {signum} received — shutting down.")
+        self._running = False
+        self._feeds.stop()
+        self.scheduler.shutdown(wait=False)
+        sys.exit(0)
+
+    def start(self):
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT,  self._signal_handler)
+
+        # Verify credentials by fetching account
+        mode_label = self._alpaca_mode_label()
+        base_url = self._alpaca_base_url()
+        try:
+            account = self._get_account()
+            account_equity = self._account_float(account, "portfolio_value", "equity", "cash")
+            if account_equity <= 0:
+                raise ValueError("Alpaca account returned no positive portfolio_value/equity/cash")
+            self._starting_cash = account_equity
+            self.peak_equity    = self._starting_cash
+            self._session_start_equity = self._starting_cash
+            cash = self._account_float(account, "cash")
+            buying_power = self._account_float(account, "buying_power")
+            self.logger.info(
+                f"Connected to Alpaca [{mode_label}] via {base_url} — "
+                f"equity: ${self._starting_cash:,.2f}, cash: ${cash:,.2f}, "
+                f"buying power: ${buying_power:,.2f}"
+            )
+        except Exception as exc:
+            self.logger.critical(
+                f"Alpaca connection failed on {mode_label} endpoint {base_url}: {exc}"
+            )
+            self.logger.critical(
+                "Check APCA_API_PAPER and make sure the API key/secret match that exact Alpaca account type. "
+                "Paper keys only work on paper-api; live keys only work on api.alpaca.markets."
+            )
+            raise
+
+        self._reconcile_managed_state_with_positions()
+        if self._is_tech_momentum_strategy():
+            self._active_universe = self._get_tech_momentum_universe()
+            self._feeds.update_symbols(self._active_universe)
+        else:
+            self._refresh_dynamic_universe(force=True)
+            self._feeds.update_symbols(self._active_universe)
+            self._feeds.start()
+            self.detect_market_regime()
+        self._setup_scheduler()
+        self.scheduler.start()
+
+        self.logger.info("=" * 60)
+        self.logger.info("ALPACA TRADING BOT STARTED")
+        self.logger.info(f"Mode:          {mode_label}")
+        self.logger.info(f"Trading style: {self.trading_style}")
+        self.logger.info(f"Core symbols:  {self.config.universe.core_symbols}")
+        self.logger.info(f"Active universe: {self._active_universe}")
+        self.logger.info(f"Regime:        {self.market_regime}")
+        self.logger.info(f"Equity:        ${self.net_liquidation:,.2f}")
+        self.logger.info("=" * 60)
+
+        self._send_alert_email(
+            "Alpaca Trading Bot Started",
+            f"Mode:          {mode_label}\n"
+            f"Trading Style: {self.trading_style}\n"
+            f"Equity:        ${self.net_liquidation:,.2f}\n"
+            f"Regime:        {self.market_regime}\n"
+            f"Core Symbols:  {', '.join(self.config.universe.core_symbols)}\n"
+            f"Dynamic Symbols: {', '.join(sorted(self._dynamic_symbols)) if self._dynamic_symbols else 'None'}\n"
+            f"Active Universe: {', '.join(self._active_universe)}\n"
+        )
+
+        try:
+            while self._running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self._signal_handler(signal.SIGINT, None)
+
+
+if __name__ == "__main__":
+    bot = AlpacaTradingBot()
+    bot.start()

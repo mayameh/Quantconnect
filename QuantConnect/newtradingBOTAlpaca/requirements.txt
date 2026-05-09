@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  EnhancedtradingBOTAlpaca — Python dependencies
+#  Install:  pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Alpaca SDK (replaces ib_insync)
+alpaca-py>=0.8.2
+
+# Data / analysis
+pandas>=2.0
+numpy>=1.26
+yfinance>=0.2.28          # historical data for backtesting
+
+# Scheduling
+APScheduler>=3.10,<4.0
+
+# Timezone / clock
+pytz>=2024.1
+tzdata>=2024.1
+
+# Environment loading
+python-dotenv>=1.0
+
+# HTTP
+requests>=2.31
+
+# Live feeds
+vaderSentiment>=3.3.2     # VADER sentiment for news scoring
+websocket-client>=1.6.0   # IEX quote WebSocket (live_feeds.py)
