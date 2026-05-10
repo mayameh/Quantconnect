@@ -16,8 +16,37 @@ git push -u origin main
 
 ```bash
 git branch --show-current
+git branch -a
+git switch <branch-name>
+git switch -c <new-branch-name>
 git push -u origin <current-branch>
 ```
+
+`git switch <branch-name>` moves you to an existing branch.
+`git switch -c <new-branch-name>` creates the branch and switches to it.
+If you want the branch to show up on GitHub, push the branch you are currently on. GitHub will not show a local branch until you push it.
+If you want the changes on `main` instead, merge the feature branch into `main` and then push `main`.
+
+If `git switch main` fails because local changes would be overwritten, use one of these options first:
+
+```bash
+git status
+git add -A
+git commit -m "Save local changes before switching branches"
+git switch main
+```
+
+Or stash the changes temporarily:
+
+```bash
+git status
+git stash push -m "temp before switching to main"
+git switch main
+git stash list
+git stash pop
+```
+
+If the blocked file is only `QuantConnect/GIT_COMMANDS.md`, committing it first is usually the cleaner option.
 
 ## Create a new bot folder in this repo
 
@@ -29,7 +58,8 @@ mkdir -p QuantConnect/tradingBOT-3SleeveHybridStrategy
 git status
 git add QuantConnect/tradingBOT-3SleeveHybridStrategy
 git commit -m "Add tradingBOT-3SleeveHybridStrategy folder"
-git push -u Quantconnect feature/newtradingbotalpaca-intraday
+git switch -c <new-branch-name>
+git push -u Quantconnect <new-branch-name>
 ```
 
 ## Workspace folders
@@ -147,7 +177,7 @@ git push -u origin main
 ### tradingBOT-3SleeveHybridStrategy
 
 ```bash
-cd ~/Library/CloudStorage/OneDrive-Personal/Mayank/Quantconnect/Quantconnect/tradingBOT-3SleeveHybridStrategy
+cd ~/Library/CloudStorage/OneDrive-Personal/Mayank/Quantconnect/QuantConnect/tradingBOT-3SleeveHybridStrategy
 git add -A
 git commit -m "Update tradingBOT-3SleeveHybridStrategy"
 git push -u Quantconnect feature/newtradingbotalpaca-intraday
@@ -196,6 +226,8 @@ If you want to switch `origin` to HTTPS first:
 git remote set-url origin https://github.com/mayameh/Quantconnect.git
 git push -u origin feature/newtradingbotalpaca-intraday
 ```
+
+If a branch only exists locally and does not appear on GitHub yet, that is normal until you push it with `git push -u <remote> <branch-name>`. After that, GitHub will show the new branch.
 
 If `git push -u origin main` returns `Permission denied (publickey)`, it means the SSH `origin` remote is not usable on this machine. Use the HTTPS `Quantconnect` remote above, or switch `origin` to HTTPS first.
 
